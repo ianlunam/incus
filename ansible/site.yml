@@ -1,0 +1,6 @@
+---
+- name: Provision Debian 13 Incus host for HAOS + AI/voice/NVR stack
+  hosts: kvm_host
+  become: true
+  roles:
+    - incus-host

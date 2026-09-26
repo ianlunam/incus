@@ -1,0 +1,15 @@
+---
+# CAUTION: see README - do the first run from console/IPMI, not a remote
+# link with no out-of-band fallback, since this moves the host's IP onto br0.
+- name: apply networking changes
+  shell: |
+    systemctl restart networking || (ifdown {{ bridge_name }} 2>/dev/null; ifup {{ host_physical_nic }}; ifup {{ bridge_name }})
+  async: 45
+  poll: 0
+  listen: "apply networking changes"
+
+- name: wait for reconnect after network change
+  wait_for_connection:
+    delay: 10
+    timeout: 90
+  listen: "apply networking changes"

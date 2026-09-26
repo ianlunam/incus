@@ -1,0 +1,9 @@
+# Managed by Ansible - do not edit by hand
+#
+# Incus's own bridge attachment for tap (VM) and veth (container) devices
+# isn't reliable on this host - it can silently leave a new instance
+# disconnected from {{ bridge_name }} after a restart (of the instance, or of
+# host networking). Enslave any such device the instant it appears, at the
+# kernel level, so this never depends on an ansible run happening afterward.
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="tap*", RUN+="/usr/bin/ip link set $env{INTERFACE} master {{ bridge_name }}"
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="veth*", RUN+="/usr/bin/ip link set $env{INTERFACE} master {{ bridge_name }}"

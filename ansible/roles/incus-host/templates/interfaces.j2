@@ -1,0 +1,33 @@
+# Managed by Ansible - do not edit by hand
+source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+auto {{ host_physical_nic }}
+iface {{ host_physical_nic }} inet manual
+
+auto {{ bridge_name }}
+iface {{ bridge_name }} inet static
+    address {{ bridge_ip }}
+    netmask {{ bridge_netmask }}
+    gateway {{ bridge_gateway }}
+    dns-nameservers {{ bridge_dns_servers }}
+    # Pinned to the physical NIC's own (fixed, hardware) MAC - a Linux bridge
+    # otherwise gets a new random MAC every time it's recreated, which would
+    # silently invalidate any router-side DHCP reservation keyed to it.
+    hwaddress ether {{ bridge_mac }}
+    bridge_ports {{ host_physical_nic }}
+    bridge_stp off
+    bridge_fd 0
+    bridge_maxwait 0
+    # Multicast snooping + no querier on this LAN silently drops the Router
+    # Advertisements OTBR needs to send to publish its Thread route to other
+    # bridged instances (matter-server, etc.) - disable it so RA/mDNS/MLD get
+    # flooded to every port like a traditional bridge. Without this, Matter
+    # commissioning over Thread fails late with "Network is unreachable".
+    up ip link set dev {{ bridge_name }} type bridge mcast_snooping 0
+{% for addr in bridge_secondary_addresses %}
+    up ip addr add {{ addr }} dev {{ bridge_name }}
+    down ip addr del {{ addr }} dev {{ bridge_name }}
+{% endfor %}

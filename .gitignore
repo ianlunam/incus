@@ -1,0 +1,12 @@
+# Environment-specific values (UniFi download URL, Thread USB IDs) -
+# never committed, per Terraform's own convention for this file type.
+*.tfvars
+*.tfvars.json
+
+# Terraform local state/cache - lives on the remote host in this setup
+# (~/terraform on incus-01), never in this repo, but excluded regardless.
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log

@@ -1,0 +1,489 @@
+---
+# --- Bridged networking (same as before - Incus attaches to this bridge) ----
+# Without bridge-utils, ifupdown creates br0 and assigns it an IP but never
+# actually enslaves bridge_ports's physical NIC to it - the bridge ends up
+# with no uplink and can reach nothing. Also load the "bridge" kernel module
+# explicitly at boot (modules-load.d) rather than relying on it having been
+# auto-loaded by something else already, which isn't guaranteed on a cold boot.
+- name: Install bridge-utils (needed for ifupdown's bridge_ports support)
+  apt:
+    name: bridge-utils
+    state: present
+
+- name: Ensure the bridge kernel module is loaded at boot, before networking starts
+  copy:
+    dest: /etc/modules-load.d/bridge.conf
+    mode: "0644"
+    content: |
+      bridge
+
+- name: Load the bridge kernel module now
+  modprobe:
+    name: bridge
+    state: present
+
+- name: Configure bridge via /etc/network/interfaces (ifupdown)
+  template:
+    src: interfaces.j2
+    dest: /etc/network/interfaces
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+  when: not use_netplan
+  notify: apply networking changes
+
+- name: Flush handlers so the bridge is up before Incus is configured
+  meta: flush_handlers
+
+# Restarting networking tears down and rebuilds br0 as a fresh kernel object -
+# fine for the physical NIC (re-enslaved automatically), but any instance's
+# tap (VMs) or veth (containers) was only ever plugged into the OLD bridge
+# when it started, and doesn't get replugged into the new one - silently
+# cutting it off from the network while it keeps running. This affects BOTH
+# VMs and containers (verified: checking reachability through a host-proxied
+# port isn't a valid test, since those tunnel via loopback inside the
+# instance's own netns and work even with eth0 fully disconnected from the
+# bridge). Re-attach unconditionally - harmless no-op if already attached.
+- name: Re-attach any instance tap/veth devices dropped by the networking restart
+  shell: |
+    for dev in $(ls /sys/class/net/ 2>/dev/null | grep -E '^(tap|veth)'); do
+      ip link set "$dev" master {{ bridge_name }}
+    done
+  changed_when: false
+  when: not use_netplan
+
+# The above only fixes what's ALREADY disconnected at the moment this
+# playbook runs. Separately confirmed that restarting a single instance
+# (independent of any host networking change) also leaves its new tap/veth
+# unattached - Incus's own bridge attachment for this device type isn't
+# reliable on this host. A udev rule closes that gap permanently: it fires
+# the instant any such device appears, with no dependency on ansible having
+# run recently.
+- name: Install udev rule to auto-attach tap/veth devices to the bridge
+  template:
+    src: 99-incus-bridge-attach.rules.j2
+    dest: /etc/udev/rules.d/99-incus-bridge-attach.rules
+    owner: root
+    group: root
+    mode: "0644"
+  register: udev_bridge_rule
+
+- name: Reload udev rules so the new rule takes effect immediately
+  command: udevadm control --reload-rules
+  when: udev_bridge_rule.changed
+
+# --- Base packages ----------------------------------------------------------
+# Both contrib and non-free-firmware are needed for nvidia-smi/firmware, but
+# the actual proprietary driver+kernel module (nvidia-driver, nvidia-kernel-dkms)
+# lives in plain non-free - non-free-firmware alone only covers firmware blobs.
+- name: Enable contrib, non-free and non-free-firmware components (needed for nvidia driver on Debian 13)
+  replace:
+    path: /etc/apt/sources.list
+    regexp: '^(deb(-src)? .*\bmain)( contrib)?( non-free)?( non-free-firmware)?$'
+    replace: '\1 contrib non-free non-free-firmware'
+
+- name: Update apt cache after sources change
+  apt:
+    update_cache: true
+
+# Needed so DKMS can actually build the nvidia and zfs kernel modules below -
+# without matching headers, both packages install "successfully" but leave
+# their module in dkms status "added" (never built), so modprobe fails later.
+- name: Install kernel headers for DKMS module builds (nvidia, zfs)
+  apt:
+    name: linux-headers-amd64
+    state: present
+
+- name: Install nvidia driver + CUDA runtime bits on the host
+  apt:
+    name:
+      - "{{ nvidia_driver_package }}"
+      - nvidia-smi
+    state: present
+
+# Debian's own repo pins Incus at 6.0.4, which predates native OCI support
+# (the "docker:" image references throughout terraform/ need Incus >= 6.1).
+# Zabbly is the Incus project's own upstream apt repo - add it so apt picks
+# up the newer build instead (higher epoch wins automatically, no pinning
+# needed).
+- name: Add Zabbly (Incus upstream) apt keyring
+  get_url:
+    url: https://pkgs.zabbly.com/key.asc
+    dest: /etc/apt/keyrings/zabbly.asc
+    mode: "0644"
+
+- name: Add Zabbly Incus stable apt repo
+  copy:
+    dest: /etc/apt/sources.list.d/zabbly-incus-stable.sources
+    mode: "0644"
+    content: |
+      Enabled: yes
+      Types: deb
+      URIs: https://pkgs.zabbly.com/incus/stable
+      Suites: {{ ansible_distribution_release }}
+      Components: main
+      Architectures: {{ ansible_architecture | regex_replace('x86_64', 'amd64') }}
+      Signed-By: /etc/apt/keyrings/zabbly.asc
+  register: zabbly_repo
+
+- name: Update apt cache after adding Zabbly repo
+  apt:
+    update_cache: true
+  when: zabbly_repo.changed
+
+- name: Install Incus and its container tooling
+  apt:
+    name:
+      - incus
+      - incus-client
+      - zfsutils-linux
+    state: present
+
+- name: Enable and start incus daemon
+  systemd:
+    name: incus
+    enabled: true
+    state: started
+
+- name: Add ansible_user to incus-admin group
+  user:
+    name: "{{ ansible_user }}"
+    groups: incus-admin
+    append: true
+
+# Headers are now present, but nvidia-kernel-dkms/zfs-dkms may have already
+# been installed (this run or a prior one) without them, leaving their
+# modules registered but never compiled ("dkms status" shows "added", not
+# "installed"). Build/load them now instead of waiting for a reboot.
+- name: Build any pending DKMS modules (nvidia, zfs) now that headers are present
+  command: dkms autoinstall
+  register: dkms_autoinstall
+  changed_when: "'Building module' in dkms_autoinstall.stdout or 'Module build for' in dkms_autoinstall.stdout"
+
+# The nvidia packages drop a modprobe blacklist for nouveau, but that only
+# stops it loading on a FUTURE boot - if nouveau is already bound to the
+# GPUs (e.g. from before this playbook ran, or the box's very first boot),
+# it has to go before nvidia can claim the same devices. Regenerating the
+# initramfs plus one reboot is the reliable way to do that; hot-unloading
+# nouveau from a live system is fragile (DRM/console references, etc.).
+- name: Regenerate initramfs so the nouveau blacklist takes effect on next boot
+  command: update-initramfs -u
+  changed_when: true
+
+- name: Check if nouveau is currently loaded
+  command: lsmod
+  register: lsmod_check
+  changed_when: false
+
+- name: Reboot to fully switch the GPUs from nouveau to the nvidia driver
+  reboot:
+    reboot_timeout: 300
+  when: "'nouveau' in lsmod_check.stdout"
+
+- name: Load the nvidia kernel module
+  command: modprobe nvidia
+  changed_when: false
+
+- name: Load the zfs kernel module
+  command: modprobe zfs
+  changed_when: false
+
+# --- Incus preseed (idempotent: only applies if not already initialised) ----
+- name: Check if Incus is already initialised
+  command: incus storage list -f csv
+  register: incus_storage_check
+  changed_when: false
+  failed_when: false
+
+- name: Preseed Incus (storage pool + bridged network profile)
+  vars:
+    incus_preseed:
+      config: {}
+      networks: []
+      storage_pools:
+        - name: "{{ incus_storage_pool }}"
+          driver: "{{ incus_storage_driver }}"
+          config: "{{ {'size': incus_storage_size} if incus_storage_driver == 'zfs' else {} }}"
+      profiles:
+        - name: default
+          devices:
+            root:
+              path: /
+              pool: "{{ incus_storage_pool }}"
+              type: disk
+            eth0:
+              name: eth0
+              nictype: bridged
+              parent: "{{ bridge_name }}"
+              type: nic
+  command: incus admin init --preseed
+  args:
+    stdin: "{{ incus_preseed | to_nice_yaml }}"
+  when: "incus_storage_check.stdout is not defined or incus_storage_pool not in incus_storage_check.stdout"
+
+# Neither remote is preconfigured by "incus admin init" - the terraform/ image
+# references (docker:..., ghcr:...) fail with "The remote ... doesn't exist"
+# until these are added explicitly, even on an Incus new enough for OCI.
+# UniFi's Ubuntu image comes from the "images:" remote instead (already
+# built in) - cloud-images.ubuntu.com's own simplestreams endpoint returned
+# zero images against this Incus build, so there's no "ubuntu:" remote here.
+- name: Add docker OCI remote for native container image pulls
+  command: incus remote add docker https://docker.io --protocol=oci
+  register: docker_remote
+  changed_when: "'already exists' not in (docker_remote.stderr | default(''))"
+  failed_when: docker_remote.rc != 0 and 'already exists' not in docker_remote.stderr
+
+- name: Add ghcr OCI remote (Frigate, python-matter-server are published here, not Docker Hub)
+  command: incus remote add ghcr https://ghcr.io --protocol=oci
+  register: ghcr_remote
+  changed_when: "'already exists' not in (ghcr_remote.stderr | default(''))"
+  failed_when: ghcr_remote.rc != 0 and 'already exists' not in ghcr_remote.stderr
+
+# --- GPU profiles: one per card, applied per-instance in Terraform ----------
+- name: Create incus profile exposing the 1070 (detection/LLM card)
+  command: >
+    incus profile create gpu-1070
+  register: profile_1070
+  changed_when: "'already exists' not in (profile_1070.stderr | default(''))"
+  failed_when: profile_1070.rc != 0 and 'already exists' not in profile_1070.stderr
+
+- name: Attach the 1070 GPU device to its profile
+  command: >
+    incus profile device add gpu-1070 gpu gpu pci={{ gpu_1070_pci }}
+  register: dev_1070
+  changed_when: "'already exists' not in (dev_1070.stderr | default(''))"
+  failed_when: dev_1070.rc != 0 and 'already exists' not in dev_1070.stderr
+
+- name: Create incus profile exposing the 1650 (voice pipeline card)
+  command: >
+    incus profile create gpu-1650
+  register: profile_1650
+  changed_when: "'already exists' not in (profile_1650.stderr | default(''))"
+  failed_when: profile_1650.rc != 0 and 'already exists' not in profile_1650.stderr
+
+- name: Attach the 1650 GPU device to its profile
+  command: >
+    incus profile device add gpu-1650 gpu gpu pci={{ gpu_1650_pci }}
+  register: dev_1650
+  changed_when: "'already exists' not in (dev_1650.stderr | default(''))"
+  failed_when: dev_1650.rc != 0 and 'already exists' not in dev_1650.stderr
+
+# --- HAOS image, imported for Incus VM use ----------------------------------
+- name: Ensure image directory exists
+  file:
+    path: "{{ haos_download_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Download HAOS qcow2.xz image
+  get_url:
+    url: "{{ haos_image_url }}"
+    dest: "{{ haos_download_dir }}/{{ haos_qcow2_name }}.xz"
+    mode: "0644"
+    timeout: 600
+
+- name: Decompress HAOS image
+  command: "xz -dk -T0 {{ haos_download_dir }}/{{ haos_qcow2_name }}.xz"
+  args:
+    creates: "{{ haos_download_dir }}/{{ haos_qcow2_name }}"
+
+- name: Check if HAOS image is already imported into Incus
+  command: incus image list haos -f csv
+  register: haos_image_check
+  changed_when: false
+
+# A bare qcow2 isn't a valid Incus image on its own - "incus image import"
+# expects a metadata tarball (with metadata.yaml) plus the actual disk image
+# as a second, separate argument. Without the metadata.yaml, Incus can't tell
+# it's meant to boot as a VM at all ("Metadata tarball is missing metadata.yaml").
+- name: Write HAOS image metadata.yaml
+  copy:
+    dest: "{{ haos_download_dir }}/metadata.yaml"
+    mode: "0644"
+    content: |
+      architecture: x86_64
+      creation_date: {{ ansible_date_time.epoch }}
+      properties:
+        architecture: x86_64
+        os: HAOS
+        release: "{{ haos_version }}"
+        description: Home Assistant OS {{ haos_version }}
+  when: haos_image_check.stdout == ""
+
+- name: Package HAOS image metadata into a tarball
+  command: >
+    tar -cJf {{ haos_download_dir }}/metadata.tar.xz
+    -C {{ haos_download_dir }} metadata.yaml
+  args:
+    creates: "{{ haos_download_dir }}/metadata.tar.xz"
+  when: haos_image_check.stdout == ""
+
+- name: Import HAOS qcow2 as a local Incus image alias "haos"
+  command: >
+    incus image import {{ haos_download_dir }}/metadata.tar.xz
+    {{ haos_download_dir }}/{{ haos_qcow2_name }}
+    --alias haos
+  when: haos_image_check.stdout == ""
+
+- name: Verify nvidia driver sees both cards
+  command: nvidia-smi -L
+  register: nvidia_check
+  changed_when: false
+
+- name: Show detected GPUs
+  debug:
+    var: nvidia_check.stdout_lines
+
+# --- Host-side bind-mount directories for container persistent data ---------
+# 0777 because these get bind-mounted into unprivileged OCI containers, whose
+# "root" is actually a shifted, unpredictable host UID (idmap.base varies per
+# instance) - 0755 root:root left them unwritable from inside the container
+# (ollama/whisper both failed on this exact permission error).
+- name: Create persistent volume directories for the container stack
+  file:
+    path: "/var/incus-volumes/{{ item }}"
+    state: directory
+    mode: "0777"
+  loop:
+    - mosquitto/config
+    - mosquitto/data
+    - frigate/config
+    - frigate/media
+    - ollama/models
+    - whisper/data
+    - esphome/config
+    - piper/data
+    - matter-server/data
+    - unifi/data
+    - unifi/log
+
+# eclipse-mosquitto has no built-in fallback config once /mosquitto/config is
+# bind-mounted (even empty, it shadows the image's own default) - without a
+# mosquitto.conf here it refuses to start at all ("Unable to open config
+# file"). force: false so a hand-edited config here is never overwritten.
+- name: Write a default mosquitto.conf if one doesn't already exist
+  copy:
+    dest: /var/incus-volumes/mosquitto/config/mosquitto.conf
+    mode: "0644"
+    force: false
+    content: |
+      listener 1883
+      allow_anonymous true
+      persistence true
+      persistence_location /mosquitto/data/
+      log_dest stdout
+
+# =============================================================================
+# Power savings
+# =============================================================================
+- name: Install power-management tooling
+  apt:
+    name:
+      - tlp
+      - linux-cpupower
+    state: present
+  when: enable_tlp
+
+- name: Enable and start TLP
+  systemd:
+    name: tlp
+    enabled: true
+    state: started
+  when: enable_tlp
+
+- name: Mask power-profiles-daemon (conflicts with TLP if present)
+  systemd:
+    name: power-profiles-daemon
+    masked: true
+    enabled: false
+    state: stopped
+  when: enable_tlp
+  failed_when: false
+
+- name: Set CPU governor persistently via systemd unit
+  copy:
+    dest: /etc/systemd/system/cpu-governor.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Set CPU frequency governor
+      After=multi-user.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/cpupower frequency-set -g {{ cpu_governor }}
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+  register: governor_unit
+
+- name: Enable and start cpu-governor unit
+  systemd:
+    name: cpu-governor
+    enabled: true
+    state: started
+    daemon_reload: "{{ governor_unit.changed }}"
+
+- name: Enable nvidia persistence daemon (keeps driver loaded, avoids re-init power/latency spikes)
+  systemd:
+    name: nvidia-persistenced
+    enabled: true
+    state: started
+  failed_when: false
+
+- name: Cap GTX 1070 power limit
+  command: "nvidia-smi -i {{ gpu_1070_pci }} -pl {{ nvidia_1070_power_limit_w }}"
+  register: pl_1070
+  changed_when: "'Power limit for GPU' in pl_1070.stdout"
+  failed_when: false
+
+- name: Cap GTX 1650 power limit
+  command: "nvidia-smi -i {{ gpu_1650_pci }} -pl {{ nvidia_1650_power_limit_w }}"
+  register: pl_1650
+  changed_when: "'Power limit for GPU' in pl_1650.stdout"
+  failed_when: false
+
+- name: Persist GPU power caps across reboots via systemd unit
+  copy:
+    dest: /etc/systemd/system/nvidia-power-limits.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Apply NVIDIA GPU power limits
+      After=nvidia-persistenced.service
+      Requires=nvidia-persistenced.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/nvidia-smi -i {{ gpu_1070_pci }} -pl {{ nvidia_1070_power_limit_w }}
+      ExecStart=/usr/bin/nvidia-smi -i {{ gpu_1650_pci }} -pl {{ nvidia_1650_power_limit_w }}
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+  register: nvidia_power_unit
+
+- name: Enable nvidia-power-limits unit
+  systemd:
+    name: nvidia-power-limits
+    enabled: true
+    state: started
+    daemon_reload: "{{ nvidia_power_unit.changed }}"
+
+- name: Cap ZFS ARC size (skip if not using zfs storage driver)
+  copy:
+    dest: /etc/modprobe.d/zfs-arc.conf
+    mode: "0644"
+    content: |
+      options zfs zfs_arc_max={{ zfs_arc_max_bytes }}
+  when: incus_storage_driver == "zfs"
+  register: zfs_arc_conf
+
+- name: Apply ZFS ARC max immediately (module param, avoids waiting for reboot)
+  command: >
+    bash -c "echo {{ zfs_arc_max_bytes }} > /sys/module/zfs/parameters/zfs_arc_max"
+  when: incus_storage_driver == "zfs"
+  changed_when: false
+  failed_when: false

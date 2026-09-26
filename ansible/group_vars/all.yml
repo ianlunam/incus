@@ -1,0 +1,81 @@
+---
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
+host_physical_nic: enp4s0
+bridge_name: br0
+use_netplan: false
+bridge_ip: "192.168.0.31"
+bridge_netmask: "255.255.255.0"
+bridge_gateway: "192.168.0.1"
+bridge_dns_servers: "1.1.1.3 1.0.0.3"
+bridge_mac: "18:c0:4d:93:a4:ff"  # host_physical_nic's own hardware MAC - pinned so
+                                  # br0 keeps a stable MAC for router DHCP reservations
+
+# Extra static IPs to alias onto the bridge, on top of bridge_ip. Used here so
+# devices hardcoded to the old HAOS box's MQTT broker IP (now decommissioned)
+# keep working against the new mosquitto container without reconfiguring each
+# one - the mosquitto proxy already listens on 0.0.0.0:1883, so it picks up
+# any address added to the bridge automatically.
+bridge_secondary_addresses:
+  - "192.168.0.156/24"
+
+# ---------------------------------------------------------------------------
+# GPUs - container passthrough mode (NOT vfio). The host installs the real
+# nvidia driver and shares each card with specific containers via cgroup
+# device injection. Identify PCI addresses with `lspci -D | grep -i nvidia`.
+# ---------------------------------------------------------------------------
+gpu_1070_pci: "0000:01:00.0"   # GTX 1070 - detection/LLM card
+gpu_1650_pci: "0000:05:00.0"   # GTX 1650 SUPER - voice pipeline card
+nvidia_driver_package: nvidia-driver   # Debian 13 non-free-firmware repo package
+
+# ---------------------------------------------------------------------------
+# Incus storage/network
+# ---------------------------------------------------------------------------
+incus_storage_pool: default
+incus_storage_driver: zfs        # zfs gives cheap snapshots; use "dir" if no spare disk/space for a zpool
+incus_storage_size: "300GiB"     # only used if incus_storage_driver == zfs and backed by a loop/file device
+
+# ---------------------------------------------------------------------------
+# HAOS image (still needed - HAOS runs as an Incus VM)
+# ---------------------------------------------------------------------------
+haos_version: "13.2"
+haos_image_url: "https://github.com/home-assistant/operating-system/releases/download/{{ haos_version }}/haos_ova-{{ haos_version }}.qcow2.xz"
+haos_download_dir: /var/lib/incus-images
+haos_qcow2_name: "haos_ova-{{ haos_version }}.qcow2"
+
+# ---------------------------------------------------------------------------
+# Thread/Zigbee radio USB stick (e.g. Home Assistant SkyConnect, ConBee II,
+# SONOFF Zigbee/Thread dongle) - passed through to the HAOS VM so its
+# built-in OTBR / Zigbee add-ons can use it directly. Find vendor:product
+# with `lsusb` on the host after plugging it in.
+thread_usb_vendor_id: "1a86"    # QinHeng Electronics USB Single Serial (from lsusb)
+thread_usb_product_id: "55d3"
+
+# ---------------------------------------------------------------------------
+# Power savings
+# ---------------------------------------------------------------------------
+# CPU frequency scaling governor. "powersave" is most aggressive; "schedutil"
+# (kernel default on most distros) is a good balance if this box is doing
+# real-time work (Frigate detection, voice pipeline latency) and full
+# "powersave" feels sluggish.
+cpu_governor: powersave
+
+# Enable TLP (laptop/desktop power-management daemon - also tunes PCIe ASPM,
+# SATA link power, USB autosuspend). Safe on desktops, not just laptops.
+enable_tlp: true
+
+# GPU power caps in watts. Both cards' stock power limits are far above what
+# Frigate/Whisper/Piper/Ollama actually need at these loads; capping trims
+# idle-and-light-load draw substantially. Set to your cards' true minimum
+# with `nvidia-smi -q -d POWER` if these defaults clip too much performance -
+# these are conservative starting points, not hard requirements.
+nvidia_1070_power_limit_w: 120   # stock is ~150W
+nvidia_1650_power_limit_w: 70    # this card is a 1650 SUPER, not a non-Ti - nvidia-smi
+                                  # enforces a hardware floor of 70W here (max ~120W stock),
+                                  # so 70 is the lowest this card will actually accept
+
+# ZFS ARC cap - without this, ZFS happily eats a big chunk of the 48GB for
+# cache, which then has to be paged/managed, costing power for no real gain
+# on a home-NVR-scale workload. Only applies if incus_storage_driver == zfs.
+zfs_arc_max_bytes: 4294967296   # 4GiB
