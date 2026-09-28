@@ -18,6 +18,8 @@ managed by the same tool:
                                             profile but doesn't itself use CUDA, Piper
                                             has no GPU inference path)
            -> container:  mosquitto       (CPU only - MQTT broker)
+           -> container:  searxng         (CPU only - self-hosted web search,
+                                            free web/Wikipedia lookups for Ollama)
            -> container:  matter-server   (CPU only - Matter support for Assist)
            -> container:  esphome         (CPU/RAM-heavy on demand - PlatformIO
                                             firmware builds, otherwise idle dashboard)
@@ -63,6 +65,7 @@ terraform/
   frigate.tf, ollama.tf        <- GPU-1070 containers
   whisper-piper.tf             <- GPU-1650 containers
   mosquitto.tf                  <- CPU-only container
+  searxng.tf                   <- self-hosted search (web tool for Ollama, see below)
   esphome.tf                   <- ESPHome dashboard (flash/manage m5stack Atom Echo S3R units)
   unifi.tf                     <- UniFi OS Server (runs as a VM, not a container - see file)
   outputs.tf                   <- endpoint summary + HA wiring instructions
@@ -243,18 +246,49 @@ toward stock (~150W) and re-run the playbook.
   minutes, not the usual under-a-minute, before assuming something's wrong).
 - **Ollama's model and HA wiring aren't managed by this repo** (same
   reasoning as Frigate's camera config below - it's runtime/data-plane
-  state, not infrastructure). Currently running `qwen2.5-coder:7b` - chosen
-  as a single model for both HA's Assist conversation agent (needs `tools`
-  capability for device control, which it has) and general coding use (e.g.
+  state, not infrastructure). Currently running `qwen2.5:7b` as a single
+  model for both HA's Assist conversation agent and general coding use (e.g.
   a VSCode extension pointed at `http://<host-ip>:11434` directly, bypassing
   HA entirely) rather than juggling two models that don't both fit in 8GB
   VRAM at once. Wired into HA via Settings > Devices & Services > Ollama
   (`http://<host-ip>:11434`), then its "conversation" subentry picks the
   model, context length (`num_ctx` - each doubling costs real VRAM, roughly
-  4.4GB/4.8GB/5.2GB at 4096/8192/16384 tokens for this model), and whether
-  it gets the Assist LLM API (needed for it to actually control devices, not
-  just chat). Assigned as the conversation engine on the Assist pipeline
+  4.4GB/4.8GB/5.2GB at 4096/8192/16384 tokens for this model), and which LLM
+  APIs it gets (`assist` for device control, `llm_intents` for search tools -
+  see below). Assigned as the conversation engine on the Assist pipeline
   that also uses Whisper/Piper.
+  **A model listing `tools` as a capability doesn't mean it reliably
+  produces tool calls Ollama can actually parse.** `qwen2.5-coder:7b` was
+  tried first (reasoning: Qwen's coder fine-tunes are marketed as retaining
+  general ability, so one model could cover both HA tool-calling and VSCode
+  coding) - it silently failed every time: instead of wrapping its function
+  call in the `<tool_call>` tags its own chat template requires, it printed
+  the raw `{"name": ..., "arguments": ...}` JSON as plain assistant text,
+  which Ollama can't parse into a real tool call - no error, it just looks
+  like an oddly-formatted normal reply. Plain `qwen2.5:7b` and `llama3.1:8b`
+  both passed a repeated direct test against Ollama's `/api/chat` (structured
+  `tool_calls` field present, 3/3 tries) - `qwen2.5:7b` was kept since it
+  uses less VRAM at the same context length. If you change models, verify
+  tool-calling with a direct `/api/chat` call and a dummy `tools` array
+  before trusting it in HA - the failure mode is silent, not an error.
+- **Web search / Wikipedia tools for Ollama**: HA core has no built-in way
+  for a conversation agent to search the web - this needs the HACS custom
+  integration `skye-harris/llm_intents` ("Tools for Assist") - not part of
+  this repo's prerequisites, install it yourself via HACS: search "Tools for
+  Assist" > install > restart HA. It registers an
+  additional LLM API (`llm_intents`, shown as "Search Services" in the
+  conversation agent's API selector) alongside HA's own `assist` API, and
+  its search provider is self-hosted **SearXNG** (`terraform/searxng.tf`,
+  `docker:searxng/searxng` image) rather than the integration's other option
+  (Brave Search API - free tier, but needs a signup/key) since SearXNG needs
+  neither an API key nor a per-query cost. SearXNG's default `settings.yml`
+  disables its JSON API (`search.formats: [html]` only, to deter scraping on
+  public instances) - not templated here since a hand-authored settings.yml
+  risks missing keys the image expects; let the image generate its own
+  default on first boot (`/var/incus-volumes/searxng/config/settings.yml`),
+  then add `json` to `search.formats` by hand and restart the container.
+  Wikipedia needs no separate service at all - `llm_intents` calls
+  Wikipedia's own public API directly.
 - This has been run end-to-end against real hardware (2x cheap ESP32-CAM
   boards, a Thread/Zigbee dongle, real Matter devices, a UniFi AP fleet, a
   full HAOS backup restore) - the rough edges above are the real ones that

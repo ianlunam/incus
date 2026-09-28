@@ -442,6 +442,7 @@
     - matter-server/data
     - unifi/data
     - unifi/log
+    - searxng/config
 
 # eclipse-mosquitto has no built-in fallback config once /mosquitto/config is
 # bind-mounted (even empty, it shadows the image's own default) - without a
