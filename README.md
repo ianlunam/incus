@@ -287,8 +287,25 @@ toward stock (~150W) and re-run the playbook.
   risks missing keys the image expects; let the image generate its own
   default on first boot (`/var/incus-volumes/searxng/config/settings.yml`),
   then add `json` to `search.formats` by hand and restart the container.
-  Wikipedia needs no separate service at all - `llm_intents` calls
-  Wikipedia's own public API directly.
+  **Wikipedia's own tool is currently disabled, not just unused.**
+  `llm_intents` calls Wikipedia's API through HA's shared `aiohttp`
+  client session without setting a custom `User-Agent` - Wikipedia
+  rejects that default signature outright (confirmed: the exact same
+  request 403s with HA's default UA string and 200s with any descriptive
+  one), so the tool fails every time, and the model was observed silently
+  falling back to stale training-data answers instead of reporting the
+  failure (asked "who is the current pope" mid-2026, got the previous one
+  back with no hint anything had gone wrong). The real fix is a one-line
+  patch to the installed `wikipedia.py` adding a `User-Agent` header to its
+  two Wikipedia requests, but that file lives on HAOS's own filesystem,
+  which this repo has no access path into (no SSH credentials for the
+  Terminal & SSH add-on were available when this was hit). Disabled via
+  the integration's options flow instead - SearXNG alone covers current-
+  events questions fine, and doesn't have this problem since it's
+  self-hosted. If you have HAOS filesystem access and want Wikipedia back:
+  patch `/config/custom_components/llm_intents/wikipedia.py`'s two
+  `session.get(...)` calls to pass `headers={"User-Agent": "some contact
+  info here"}`, restart HA, then re-enable it in the integration options.
 - This has been run end-to-end against real hardware (2x cheap ESP32-CAM
   boards, a Thread/Zigbee dongle, real Matter devices, a UniFi AP fleet, a
   full HAOS backup restore) - the rough edges above are the real ones that
