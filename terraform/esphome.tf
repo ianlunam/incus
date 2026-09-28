@@ -12,8 +12,11 @@ resource "incus_instance" "esphome" {
   profiles = ["default"]
 
   config = {
-    "limits.cpu"    = "1"
-    "limits.memory" = "1GiB"
+    # Bumped from 1 CPU / 1GiB - PlatformIO firmware builds (triggered from
+    # the dashboard or OTA pushes) are genuinely CPU/RAM-hungry compile jobs,
+    # not part of the otherwise-idle dashboard's normal footprint.
+    "limits.cpu"    = "6"
+    "limits.memory" = "6GiB"
     "boot.autostart" = "true"
   }
 

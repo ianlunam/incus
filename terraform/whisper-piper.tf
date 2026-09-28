@@ -11,6 +11,14 @@ resource "incus_instance" "whisper" {
     "limits.cpu"    = "2"
     "limits.memory" = "2GiB"
     "boot.autostart" = "true"
+    # docker_run.sh defaults to --device cpu unless this is set - it's the
+    # same env var the image's own Dockerfile.gpu variant uses, so this is
+    # the intended way to opt in rather than overriding the entrypoint.
+    # Needs the gpu-1650 profile's nvidia.runtime to actually inject
+    # libcuda.so, or ctranslate2 fails with "CUDA driver version is
+    # insufficient for CUDA runtime version" despite the device nodes being
+    # present.
+    "environment.STT_DEVICE" = "cuda"
   }
 
   device {
