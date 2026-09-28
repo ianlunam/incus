@@ -11,23 +11,26 @@ managed by the same tool:
          share the host's GPU driver, unlike VM passthrough)
       -> Incus
            -> VM:        haos            (Home Assistant OS, no GPU needed)
-           -> container:  frigate         (CPU only - object detection; see GPU note below)
-           -> container:  ollama          (GPU: 1070 - local LLM for Assist)
+           -> container:  frigate         (GPU: 1070 - object detection, onnx/CUDA)
+           -> container:  ollama          (GPU: 1070 - local LLM for Assist + coding)
            -> container:  whisper         (GPU: 1650 - speech-to-text)
-           -> container:  piper           (GPU: 1650 - text-to-speech)
+           -> container:  piper           (CPU - text-to-speech; attached to gpu-1650
+                                            profile but doesn't itself use CUDA, Piper
+                                            has no GPU inference path)
            -> container:  mosquitto       (CPU only - MQTT broker)
            -> container:  matter-server   (CPU only - Matter support for Assist)
-           -> container:  esphome         (CPU only - ESPHome dashboard/build+flash server)
+           -> container:  esphome         (CPU/RAM-heavy on demand - PlatformIO
+                                            firmware builds, otherwise idle dashboard)
            -> VM:        unifi           (UniFi OS Server - needs a full OS, not a container)
 
-GPU split: the plan was to share the 1070 (more VRAM/compute) between
-Frigate and Ollama, the two heaviest consumers, with the 1650 handling the
-lighter Whisper/Piper voice pipeline. In practice Frigate can't use the 1070
-at all right now (see the CUDA/Pascal note under "Known rough edges") - it's
-still attached to the `gpu-1070` profile alongside Ollama (harmless, doesn't
-reserve anything), but only Ollama actually uses it. Adjust profile
-assignments in `ansible/group_vars/all.yml` and each container's `.tf` file
-if your GPUs are newer and don't hit that wall.
+GPU split: the 1070 (more VRAM/compute) is shared between Frigate and Ollama,
+the two heaviest consumers, with the 1650 handling Whisper (Piper stays on
+CPU regardless of profile). Getting GPU acceleration actually working inside
+containers needed one non-obvious extra step beyond Incus's `gpu` device -
+see "nvidia.runtime and the container GPU library gap" under Known rough
+edges. Both cards are confirmed working end-to-end on Pascal/Turing
+(GTX 1070 + GTX 1650 SUPER) with driver 580 - the CUDA-version wall this repo
+used to hit here is now fixed, not a hardware dead end.
 
 Containers use Incus's native OCI support (pulls `docker:` images directly,
 no nested Docker-in-container needed) - this requires **Incus >= 6.1**.
@@ -45,10 +48,15 @@ ansible/
   site.yml
   roles/incus-host/            <- bridge (+ bridge-utils, a udev rule to keep
                                    VM/container network devices attached),
-                                   nvidia driver, DKMS/nouveau handling,
-                                   Zabbly Incus repo, Incus install/init,
-                                   docker/ghcr OCI remotes, GPU profiles,
-                                   HAOS image import, volume dirs
+                                   nvidia driver (skipped if one's already
+                                   active, e.g. installed by hand via
+                                   NVIDIA's .run installer - see the
+                                   nvidia.runtime note below), DKMS/nouveau
+                                   handling, nvidia-container-toolkit +
+                                   nvidia.runtime (GPU libs inside
+                                   containers), Zabbly Incus repo, Incus
+                                   install/init, docker/ghcr OCI remotes,
+                                   GPU profiles, HAOS image import, volume dirs
 terraform/
   provider.tf                  <- Incus provider
   haos.tf                      <- HAOS VM
@@ -131,17 +139,33 @@ toward stock (~150W) and re-run the playbook.
 
 ## Known rough edges - read before running
 
-- **Frigate can't use an NVIDIA GPU on Pascal cards (GTX 10-series) with
-  current Frigate releases.** Frigate's `onnx` detector needs CUDA 12.8,
-  which needs driver >=570 - but NVIDIA dropped Pascal/Maxwell/Volta support
-  starting at driver 560, so a Pascal card is permanently stuck on the 550.x
-  branch (the last one that supports it). There's no driver version that
-  satisfies both at once; this isn't a config problem, it's a real dead end
-  for this GPU generation. Frigate's own native `tensorrt` detector is also a
-  dead end on x86_64 - it's been deprecated in favor of Jetson-only ARM
-  builds. If you're on Pascal, budget for CPU-only detection (fine for a
-  couple of low-res/low-fps cameras) or a newer GPU. Turing and later
-  (GTX 16xx/RTX 20xx+) shouldn't hit this at all.
+- **`nvidia.runtime` and the container GPU library gap.** Frigate's `onnx`
+  detector (and Ollama, and Whisper) initially failed with "CUDA driver
+  version is insufficient for CUDA runtime version" even on a freshly
+  updated host driver - misleading, since the host driver was fine. Root
+  cause: Incus's plain `gpu` device only passes through the `/dev/nvidia*`
+  device nodes, not the host driver's userspace libraries (`libcuda.so`
+  etc) - unlike Docker's `--gpus` flag, which injects both. Fix: install
+  `nvidia-container-toolkit`/`libnvidia-container` on the host (the
+  `incus-host` role does this) and set `nvidia.runtime = true` on the GPU
+  profiles (also automated - see `gpu-1070`/`gpu-1650` profile tasks).
+  Needs driver >=570 for CUDA 12.8 (Frigate's `onnx` detector requirement);
+  the earlier belief that this made Pascal (GTX 10-series) a hard dead end
+  was wrong - Pascal supports driver 580 fine, confirmed working via
+  NVIDIA's official `.run` installer (Debian 13's own apt repo was just
+  behind at the time). Frigate's native `tensorrt` detector is still a dead
+  end on x86_64 (deprecated for Jetson-only ARM builds) - use `onnx`.
+  **Gotcha:** setting `nvidia.runtime` on a profile doesn't retroactively
+  fix an already-running container - it needs a restart (`incus restart
+  <name>`) to actually get the injected libraries.
+- **Whisper defaults to CPU even with a working GPU passthrough.** The
+  `rhasspy/wyoming-whisper` image's `docker_run.sh` only requests
+  `--device cuda` if `STT_DEVICE=cuda` is set (same env var its own GPU
+  build variant sets internally) - otherwise it silently runs on CPU with
+  no error. `whisper-piper.tf` sets `"environment.STT_DEVICE" = "cuda"` to
+  opt in; still needs the `nvidia.runtime` fix above and a restart to take
+  effect. Piper doesn't have a GPU path at all regardless of profile - it's
+  a CPU-native TTS engine by design.
 - **HAOS image import** now generates its own `metadata.yaml` and packages
   it into the metadata tarball `incus image import` expects (a bare qcow2
   isn't a valid Incus image on its own - Incus can't tell it's meant to boot
@@ -189,9 +213,15 @@ toward stock (~150W) and re-run the playbook.
 - **GPU device syntax** (`incus profile device add ... gpu pci=<addr>`) is
   correct for Incus's GPU device type but pins the whole card to whichever
   container profile uses it - anything sharing a profile gets concurrent
-  access to the same card. Right now only Ollama actually uses `gpu-1070`
-  (see the Frigate/Pascal note above), so this isn't a live concern, but
-  keep an eye on `nvidia-smi` if you add something else to that profile.
+  access to the same card. Frigate and Ollama both share `gpu-1070` now and
+  fit comfortably (Frigate's detector ~250MB, Ollama's 7B Q4 model
+  ~4.4-5.2GB depending on context length, well under the 1070's 8GB) - keep
+  an eye on `nvidia-smi` if you add a third consumer or a bigger model.
+  Ollama itself will only keep one model resident on a GPU at a time by
+  default (no `OLLAMA_MAX_LOADED_MODELS` override here) - loading a second
+  model that doesn't fit alongside the first evicts it entirely rather than
+  splitting across GPU/CPU, so don't expect two large models warm at once
+  on one card.
 - **MAC addresses and DHCP reservations**: every instance's `eth0` device
   now pins `hwaddr` explicitly to whatever address it already had, so
   router-side DHCP reservations survive future recreation (Incus otherwise
@@ -211,6 +241,20 @@ toward stock (~150W) and re-run the playbook.
   on. Expect the first boot after a genuine cold start to take noticeably
   longer than a normal `incus restart` (HAOS in particular - budget several
   minutes, not the usual under-a-minute, before assuming something's wrong).
+- **Ollama's model and HA wiring aren't managed by this repo** (same
+  reasoning as Frigate's camera config below - it's runtime/data-plane
+  state, not infrastructure). Currently running `qwen2.5-coder:7b` - chosen
+  as a single model for both HA's Assist conversation agent (needs `tools`
+  capability for device control, which it has) and general coding use (e.g.
+  a VSCode extension pointed at `http://<host-ip>:11434` directly, bypassing
+  HA entirely) rather than juggling two models that don't both fit in 8GB
+  VRAM at once. Wired into HA via Settings > Devices & Services > Ollama
+  (`http://<host-ip>:11434`), then its "conversation" subentry picks the
+  model, context length (`num_ctx` - each doubling costs real VRAM, roughly
+  4.4GB/4.8GB/5.2GB at 4096/8192/16384 tokens for this model), and whether
+  it gets the Assist LLM API (needed for it to actually control devices, not
+  just chat). Assigned as the conversation engine on the Assist pipeline
+  that also uses Whisper/Piper.
 - This has been run end-to-end against real hardware (2x cheap ESP32-CAM
   boards, a Thread/Zigbee dongle, real Matter devices, a UniFi AP fleet, a
   full HAOS backup restore) - the rough edges above are the real ones that
