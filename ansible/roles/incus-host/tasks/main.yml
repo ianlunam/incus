@@ -95,12 +95,28 @@
     name: linux-headers-amd64
     state: present
 
+- name: Check if an NVIDIA driver is already active on the host
+  command: nvidia-smi --query-gpu=driver_version --format=csv,noheader
+  register: nvidia_driver_check
+  changed_when: false
+  failed_when: false
+
+# incus-01 currently runs 580.178.04 installed by hand from NVIDIA's official
+# .run installer (https://download.nvidia.com/XFree86/Linux-x86_64/580.178.04/),
+# not this apt package - `dpkg -l | grep nvidia` is empty. That was needed
+# because Frigate's onnxruntime-gpu requires CUDA 12.8 / driver >=570, newer
+# than what was in the apt repo at the time. Installing nvidia-driver here
+# regardless would fight the .run installer's files (mismatched kernel module
+# vs userspace library versions, DKMS rebuilding the wrong version), so this
+# only runs when no driver is present at all - if you need to move off the
+# .run install, remove it first (nvidia-uninstall) and rerun this play.
 - name: Install nvidia driver + CUDA runtime bits on the host
   apt:
     name:
       - "{{ nvidia_driver_package }}"
       - nvidia-smi
     state: present
+  when: nvidia_driver_check.rc != 0
 
 # Debian's own repo pins Incus at 6.0.4, which predates native OCI support
 # (the "docker:" image references throughout terraform/ need Incus >= 6.1).
@@ -167,19 +183,24 @@
 # it has to go before nvidia can claim the same devices. Regenerating the
 # initramfs plus one reboot is the reliable way to do that; hot-unloading
 # nouveau from a live system is fragile (DRM/console references, etc.).
+# Only relevant when this play just apt-installed the driver above - when a
+# driver is already active (the .run install on incus-01, or a prior apt
+# install), nouveau has already been dealt with one way or another.
 - name: Regenerate initramfs so the nouveau blacklist takes effect on next boot
   command: update-initramfs -u
   changed_when: true
+  when: nvidia_driver_check.rc != 0
 
 - name: Check if nouveau is currently loaded
   command: lsmod
   register: lsmod_check
   changed_when: false
+  when: nvidia_driver_check.rc != 0
 
 - name: Reboot to fully switch the GPUs from nouveau to the nvidia driver
   reboot:
     reboot_timeout: 300
-  when: "'nouveau' in lsmod_check.stdout"
+  when: nvidia_driver_check.rc != 0 and 'nouveau' in lsmod_check.stdout
 
 - name: Load the nvidia kernel module
   command: modprobe nvidia
@@ -240,6 +261,62 @@
   changed_when: "'already exists' not in (ghcr_remote.stderr | default(''))"
   failed_when: ghcr_remote.rc != 0 and 'already exists' not in ghcr_remote.stderr
 
+# --- CUDA userspace libraries for unprivileged containers -------------------
+# Incus's plain "gpu" device only passes through the device nodes (/dev/
+# nvidia0 etc) - it does NOT inject the host's driver userspace libraries
+# (libcuda.so) into the container the way Docker's --gpus flag does. Without
+# this, any CUDA-using process in the container fails with a misleading
+# "CUDA driver version is insufficient for CUDA runtime version" error even
+# though the host driver is fine - onnxruntime (Frigate) hit this, and
+# presumably Ollama would too under real load, since it was never actually
+# confirmed to be doing GPU inference (no model was ever pulled into it).
+# nvidia-container-toolkit/libnvidia-container provides the pieces Incus's
+# own `nvidia.runtime` container config key needs to fix this.
+- name: Add NVIDIA container toolkit apt keyring
+  get_url:
+    url: https://nvidia.github.io/libnvidia-container/gpgkey
+    dest: /tmp/nvidia-container-toolkit-key.asc
+    mode: "0644"
+
+- name: Dearmor the NVIDIA container toolkit key
+  command: gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg /tmp/nvidia-container-toolkit-key.asc
+  args:
+    creates: /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+- name: Add NVIDIA container toolkit apt repo
+  get_url:
+    url: https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list
+    dest: /tmp/nvidia-container-toolkit.list.raw
+    mode: "0644"
+
+- name: Rewrite the repo list to reference the local signing key
+  command: >
+    sed -i 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g'
+    /tmp/nvidia-container-toolkit.list.raw
+  changed_when: true
+
+- name: Install the rewritten NVIDIA container toolkit repo list
+  copy:
+    src: /tmp/nvidia-container-toolkit.list.raw
+    dest: /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    remote_src: true
+    mode: "0644"
+  register: nvct_repo
+
+- name: Update apt cache after adding NVIDIA container toolkit repo
+  apt:
+    update_cache: true
+  when: nvct_repo.changed
+
+- name: Install nvidia-container-toolkit
+  apt:
+    name:
+      - nvidia-container-toolkit
+      - nvidia-container-toolkit-base
+      - libnvidia-container-tools
+      - libnvidia-container1
+    state: present
+
 # --- GPU profiles: one per card, applied per-instance in Terraform ----------
 - name: Create incus profile exposing the 1070 (detection/LLM card)
   command: >
@@ -255,6 +332,10 @@
   changed_when: "'already exists' not in (dev_1070.stderr | default(''))"
   failed_when: dev_1070.rc != 0 and 'already exists' not in dev_1070.stderr
 
+- name: Enable the NVIDIA container runtime on the 1070 profile
+  command: incus profile set gpu-1070 nvidia.runtime true
+  changed_when: true
+
 - name: Create incus profile exposing the 1650 (voice pipeline card)
   command: >
     incus profile create gpu-1650
@@ -268,6 +349,10 @@
   register: dev_1650
   changed_when: "'already exists' not in (dev_1650.stderr | default(''))"
   failed_when: dev_1650.rc != 0 and 'already exists' not in dev_1650.stderr
+
+- name: Enable the NVIDIA container runtime on the 1650 profile
+  command: incus profile set gpu-1650 nvidia.runtime true
+  changed_when: true
 
 # --- HAOS image, imported for Incus VM use ----------------------------------
 - name: Ensure image directory exists
