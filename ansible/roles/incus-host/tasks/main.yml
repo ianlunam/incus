@@ -573,3 +573,76 @@
   when: incus_storage_driver == "zfs"
   changed_when: false
   failed_when: false
+
+# --- Host monitoring: Glances (host stats) + Incus metrics (per-instance) ---
+# Glances runs directly on the host, not in a container - monitoring "the
+# host" from inside a container would only ever show that container's own
+# cgroup-limited view, not true host-wide CPU/memory/GPU stats.
+- name: Install Glances and its non-GPU dependencies
+  apt:
+    name:
+      - glances
+      - lm-sensors
+      - python3-pip
+      # Debian's glances package doesn't pull this in, but web/API mode
+      # needs it (fails at startup with "jinja2 must be installed" without
+      # it) - also the Debian package is a "+dfsg" repackage that strips the
+      # WebUI's bundled static assets, hence --disable-webui below rather
+      # than trying to fix that; we only need the REST API for HA anyway.
+      - python3-jinja2
+    state: present
+
+# Do NOT `apt install python3-pynvml` for GPU support - it depends on
+# Debian's own libnvidia-ml1 (driver 550.163.01), which drags in
+# nvidia-alternative/glx-alternative-nvidia/nvidia-installer-cleanup - a
+# whole apt-managed driver stack that conflicts with the .run-installed 580
+# driver these GPUs actually need (nvidia-installer-cleanup's entire job is
+# finding and removing exactly that kind of install). Hit this directly:
+# the postinst script failed non-interactively before doing anything
+# destructive, but don't rely on that - avoid the apt package entirely.
+# nvidia-ml-py is a pure ctypes wrapper with no bundled library of its own -
+# it dlopens whatever libnvidia-ml.so.1 is already on the system (the
+# working .run-installed one), so pip installing just this is safe.
+- name: Install nvidia-ml-py via pip for Glances' GPU plugin (not via apt - see above)
+  command: python3 -m pip install --break-system-packages nvidia-ml-py
+  args:
+    creates: /usr/lib/python3/dist-packages/pynvml/__init__.py
+  register: nvidia_ml_py_pip
+  # dist-packages is where apt's python3 would look, but pip installs to
+  # /usr/local/lib - "creates" above never matches, so this always runs;
+  # harmless (pip itself is idempotent/no-ops when already installed), but
+  # the actual check for "did this change anything" is the pip output.
+  changed_when: "'Successfully installed' in nvidia_ml_py_pip.stdout"
+
+- name: Override Glances' systemd unit to run the REST API instead of the legacy XML-RPC server
+  copy:
+    dest: /etc/systemd/system/glances.service.d/override.conf
+    mode: "0644"
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=/usr/bin/glances -w --disable-webui --bind 0.0.0.0 --port 61208
+  register: glances_override
+
+- name: Reload systemd after Glances override change
+  systemd:
+    daemon_reload: true
+  when: glances_override.changed
+
+- name: Enable and start Glances
+  systemd:
+    name: glances
+    enabled: true
+    state: "{{ 'restarted' if glances_override.changed else 'started' }}"
+
+# Per-container CPU/memory/network detail via Incus's own /1.0/metrics
+# endpoint was investigated and deliberately not pursued: it needs Incus's
+# HTTPS API exposed to the network (core.https_address, off by default) AND
+# a client certificate for every request (no anonymous access), and HA's
+# core `rest` integration has no way to present a client cert at all - the
+# only way to actually consume it would be a custom bridge service (present
+# the cert to Incus on one side, serve plain unauthenticated JSON on the
+# other), which was judged not worth the added moving part. Glances above
+# already covers per-container *disk* usage for free (each container's ZFS
+# dataset is its own mount point, which Glances' disk plugin discovers on
+# its own) - CPU/memory/network stay host-aggregate-only.
