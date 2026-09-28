@@ -304,13 +304,13 @@ toward stock (~150W) and re-run the playbook.
   Terminal & SSH add-on) and re-enabling Wikipedia in the integration
   options - confirmed working with real, current Wikipedia content. Also
   submitted upstream as
-  [skye-harris/llm_intents#164](https://github.com/skye-harris/llm_intents/pull/164)
+  [skye-harris/llm_intents#165](https://github.com/skye-harris/llm_intents/pull/165)
   so this isn't just a local patch waiting to be erased.
   **This is exactly the kind of fix that doesn't survive a HACS update** -
   HACS will pull a fresh copy of `wikipedia.py` from GitHub on the next
   update to this integration, silently reverting the patch (no error, it'll
   just start failing again with the same symptom: model answers as if the
-  lookup never happened). Until PR #164 (or an equivalent) is merged and
+  lookup never happened). Until PR #165 (or an equivalent) is merged and
   released: after any `llm_intents` update, check whether Wikipedia answers
   are actually current, and if not, check the PR's status - if unmerged,
   reapply the same two-line header change by hand.
