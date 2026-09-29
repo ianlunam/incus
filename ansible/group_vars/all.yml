@@ -79,3 +79,10 @@ nvidia_1650_power_limit_w: 70    # this card is a 1650 SUPER, not a non-Ti - nvi
 # cache, which then has to be paged/managed, costing power for no real gain
 # on a home-NVR-scale workload. Only applies if incus_storage_driver == zfs.
 zfs_arc_max_bytes: 4294967296   # 4GiB
+
+# Used by the incus-metrics-push service (see main.yml) to push per-instance
+# CPU/memory stats to HA's own REST API - no https_address/client-cert setup
+# needed since it reads Incus's metrics over the local unix socket, not the
+# network. Needs a matching HA long-lived access token dropped by hand into
+# /etc/incus-metrics-push/ha_token on the host (never committed here).
+ha_url: "http://192.168.0.149:8123"

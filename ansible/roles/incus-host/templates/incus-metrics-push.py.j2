@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Push per-instance Incus CPU/memory stats to Home Assistant's REST API.
+
+Reads Incus's own /1.0/metrics endpoint over the LOCAL unix socket (via
+`incus query`, same access the CLI always has) - no core.https_address, no
+client certificate, no network exposure of Incus's API at all. This is
+deliberately a push, not something HA pulls: HA's core `rest` integration
+has no way to present a client certificate, and the metrics endpoint has no
+anonymous-access mode, so the only way to get this data into HA turned out
+to be having the host push it out instead.
+
+CPU is a %, computed from the change in cumulative cpu-seconds between this
+run and the previous one (state persisted in STATE_FILE), divided by the
+wall-clock time between runs - the same technique `top`/`docker stats` use,
+just averaged over this script's run interval instead of a live sample.
+This needed a real gap between samples: Incus's own metrics collector only
+refreshes cpu-seconds roughly every 8-10s internally, so two queries a
+second apart (the original approach here) always saw byte-identical
+values and a permanent 0% - comparing across timer runs (minutes apart)
+sidesteps that entirely, and does not need to block the script at all.
+A container with 4 cores pegged at 50% each would report 200%, matching
+how those tools show multi-core usage, not capped at 100%.
+"""
+import json
+import subprocess
+import time
+import urllib.error
+import urllib.request
+
+HA_URL = "{{ ha_url }}"
+TOKEN_FILE = "/etc/incus-metrics-push/ha_token"
+STATE_FILE = "/etc/incus-metrics-push/.last_state.json"
+
+
+def get_metrics_text():
+    return subprocess.run(
+        ["incus", "query", "/1.0/metrics"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+
+def parse_metrics(text):
+    """Sum each metric per instance name, across any other labels (cpu core, disk device, etc)."""
+    data = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        name_and_labels, _, value = line.rpartition(" ")
+        name, _, labels_str = name_and_labels.partition("{")
+        labels = {}
+        if labels_str:
+            for pair in labels_str.rstrip("}").split(","):
+                k, _, v = pair.partition("=")
+                labels[k] = v.strip('"')
+        inst = labels.get("name")
+        if not inst:
+            continue
+        bucket = data.setdefault(inst, {})
+        bucket[name] = bucket.get(name, 0.0) + float(value)
+    return data
+
+
+def push_state(token, entity_id, state, attributes):
+    req = urllib.request.Request(
+        f"{HA_URL}/api/states/{entity_id}",
+        data=json.dumps({"state": state, "attributes": attributes}).encode(),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        resp.read()
+
+
+def load_previous_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def main():
+    with open(TOKEN_FILE) as f:
+        token = f.read().strip()
+
+    now = time.time()
+    current = parse_metrics(get_metrics_text())
+    previous_state = load_previous_state()
+
+    for inst, metrics in current.items():
+        mem_mb = round(metrics.get("incus_memory_Active_bytes", 0.0) / 1024 / 1024, 1)
+        safe_name = inst.replace("-", "_")
+
+        try:
+            push_state(
+                token,
+                f"sensor.incus_{safe_name}_memory",
+                mem_mb,
+                {
+                    "unit_of_measurement": "MB",
+                    "friendly_name": f"{inst} Memory",
+                    "device_class": "data_size",
+                    "icon": "mdi:memory",
+                },
+            )
+        except urllib.error.URLError as e:
+            print(f"Failed to push memory for {inst}: {e}")
+
+        if previous_state is None:
+            continue  # first run ever - no previous sample to diff CPU against
+
+        prev_metrics = previous_state["instances"].get(inst)
+        if prev_metrics is None:
+            continue  # instance didn't exist last run (just created)
+
+        elapsed = now - previous_state["timestamp"]
+        cpu_delta = metrics.get("incus_cpu_seconds_total", 0.0) - prev_metrics.get(
+            "incus_cpu_seconds_total", 0.0
+        )
+        cpu_pct = round((cpu_delta / elapsed) * 100, 1) if elapsed > 0 else 0.0
+
+        try:
+            push_state(
+                token,
+                f"sensor.incus_{safe_name}_cpu",
+                cpu_pct,
+                {
+                    "unit_of_measurement": "%",
+                    "friendly_name": f"{inst} CPU",
+                    "icon": "mdi:chip",
+                },
+            )
+        except urllib.error.URLError as e:
+            print(f"Failed to push CPU for {inst}: {e}")
+
+    with open(STATE_FILE, "w") as f:
+        json.dump({"timestamp": now, "instances": current}, f)
+
+
+if __name__ == "__main__":
+    main()

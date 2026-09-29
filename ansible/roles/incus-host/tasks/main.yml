@@ -635,14 +635,80 @@
     enabled: true
     state: "{{ 'restarted' if glances_override.changed else 'started' }}"
 
-# Per-container CPU/memory/network detail via Incus's own /1.0/metrics
-# endpoint was investigated and deliberately not pursued: it needs Incus's
-# HTTPS API exposed to the network (core.https_address, off by default) AND
-# a client certificate for every request (no anonymous access), and HA's
-# core `rest` integration has no way to present a client cert at all - the
-# only way to actually consume it would be a custom bridge service (present
-# the cert to Incus on one side, serve plain unauthenticated JSON on the
-# other), which was judged not worth the added moving part. Glances above
-# already covers per-container *disk* usage for free (each container's ZFS
-# dataset is its own mount point, which Glances' disk plugin discovers on
-# its own) - CPU/memory/network stay host-aggregate-only.
+# Per-container CPU/memory via Incus's own /1.0/metrics endpoint. Pulling
+# this into HA (a REST sensor querying Incus directly) turned out not to be
+# possible: it needs Incus's HTTPS API exposed to the network
+# (core.https_address, off by default) AND a client certificate for every
+# request (no anonymous access), and HA's core `rest` integration has no way
+# to present a client cert at all. Pushing instead sidesteps both problems -
+# this script reads /1.0/metrics over the LOCAL unix socket (same access
+# `incus` CLI commands always have, no network/cert story needed at all) and
+# posts parsed values straight to HA's own REST API. Glances above already
+# covers per-container *disk* usage for free (each container's ZFS dataset
+# is its own mount point, discovered by Glances' disk plugin on its own) -
+# this fills in the CPU/memory gap Glances can't see per-container.
+- name: Create directory for the Incus metrics push script and token
+  file:
+    path: /etc/incus-metrics-push
+    state: directory
+    mode: "0700"
+
+- name: Deploy the Incus metrics push script
+  template:
+    src: incus-metrics-push.py.j2
+    dest: /etc/incus-metrics-push/push.py
+    mode: "0755"
+
+# The token itself is a secret and never templated/committed here - this
+# just makes sure the expected path exists with locked-down permissions so
+# it's obvious where to put it. Get a long-lived access token from your HA
+# user profile (bottom of the page) and write it to this file with no
+# trailing newline. force: false so a token already placed here survives
+# reruns.
+- name: Create a placeholder for the HA long-lived access token, if absent
+  copy:
+    dest: /etc/incus-metrics-push/ha_token
+    mode: "0600"
+    force: false
+    content: |
+      REPLACE_ME_WITH_A_HOME_ASSISTANT_LONG_LIVED_ACCESS_TOKEN
+
+- name: Install a systemd service for the Incus metrics push script
+  copy:
+    dest: /etc/systemd/system/incus-metrics-push.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Push per-instance Incus stats to Home Assistant
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/python3 /etc/incus-metrics-push/push.py
+  register: incus_metrics_push_unit
+
+- name: Install a systemd timer to run the Incus metrics push every 2 minutes
+  copy:
+    dest: /etc/systemd/system/incus-metrics-push.timer
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Run incus-metrics-push every 2 minutes
+
+      [Timer]
+      OnBootSec=2min
+      OnUnitActiveSec=2min
+
+      [Install]
+      WantedBy=timers.target
+  register: incus_metrics_push_timer
+
+- name: Reload systemd after installing the Incus metrics push units
+  systemd:
+    daemon_reload: true
+  when: incus_metrics_push_unit.changed or incus_metrics_push_timer.changed
+
+- name: Enable and start the Incus metrics push timer
+  systemd:
+    name: incus-metrics-push.timer
+    enabled: true
+    state: started

@@ -10,3 +10,8 @@
 *.tfstate
 *.tfstate.*
 crash.log
+
+# Isolated gh CLI auth used for public-repo contributions (PRs/issues) under
+# a specific GitHub account, kept separate from other gh/git sessions on
+# this machine - holds a live token, never committed.
+.gh-config-ianlunam/

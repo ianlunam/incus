@@ -58,7 +58,9 @@ ansible/
                                    nvidia.runtime (GPU libs inside
                                    containers), Zabbly Incus repo, Incus
                                    install/init, docker/ghcr OCI remotes,
-                                   GPU profiles, HAOS image import, volume dirs
+                                   GPU profiles, HAOS image import, volume dirs,
+                                   Glances + incus-metrics-push (host/GPU/
+                                   per-container monitoring - see below)
 terraform/
   provider.tf                  <- Incus provider
   haos.tf                      <- HAOS VM
@@ -314,6 +316,44 @@ toward stock (~150W) and re-run the playbook.
   released: after any `llm_intents` update, check whether Wikipedia answers
   are actually current, and if not, check the PR's status - if unmerged,
   reapply the same two-line header change by hand.
+- **Host/GPU monitoring in HA**: [Glances](https://nicolargo.github.io/glances/)
+  runs directly on the Debian host (not containerized - monitoring "the
+  host" from inside a container would only ever show that container's own
+  cgroup-limited view, not true host-wide stats), exposing its REST API on
+  port 61208 for HA's built-in Glances integration. Gives CPU, memory, disk,
+  network, per-core temps, and both GPUs' utilization/memory/temp/fan via
+  `nvidia-ml-py` - deliberately installed via pip, not apt's
+  `python3-pynvml`, which depends on Debian's own `libnvidia-ml1` (driver
+  550.163.01) and drags in `nvidia-alternative`/`nvidia-installer-cleanup`,
+  an apt-managed driver stack that actively conflicts with the
+  .run-installed 580 driver these GPUs need (hit this directly mid-install -
+  see `incus-host`'s tasks for the full story). `nvidia-ml-py` is a pure
+  ctypes wrapper with no bundled library, so it just uses whatever
+  `libnvidia-ml.so.1` is already on the system. Debian's glances package is
+  a `+dfsg` repackage missing the WebUI's bundled static assets, hence
+  `--disable-webui` - only the REST API is needed anyway.
+  Per-container CPU/memory (Glances only sees the host's aggregate view,
+  though it does show per-container *disk* usage for free via ZFS mount
+  discovery) comes from a separate mechanism: `incus-metrics-push.timer`
+  runs a script every 2 minutes that reads Incus's own `/1.0/metrics` over
+  the **local unix socket** (`incus query`, the same access the CLI always
+  has) and pushes parsed CPU%/memory values straight to HA's REST API
+  (`POST /api/states/<entity>`) as `sensor.incus_<name>_cpu`/`_memory`.
+  This exists because the more obvious approach - HA pulling from Incus
+  directly - turned out not to be possible at all: Incus's metrics endpoint
+  needs `core.https_address` exposed to the network (off by default) *and*
+  a client certificate for every request (no anonymous access), and HA's
+  core `rest` integration has no way to present a client cert. Pushing from
+  the host sidesteps both problems entirely. Needs a HA long-lived access
+  token dropped by hand into `/etc/incus-metrics-push/ha_token` (never
+  committed here, same secrets discipline as everywhere else). CPU% is
+  computed from the change in cumulative cpu-seconds between this run and
+  the *previous* run (state kept in `.last_state.json` next to the token) -
+  not two samples taken a second apart within one run, which was the first
+  thing tried and always measured 0%: Incus's own metrics collector only
+  refreshes cpu-seconds internally every ~8-10s, so two queries a second
+  apart are byte-identical every time. Comparing across timer runs (minutes
+  apart) sidesteps that and doesn't need the script to block at all.
 - This has been run end-to-end against real hardware (2x cheap ESP32-CAM
   boards, a Thread/Zigbee dongle, real Matter devices, a UniFi AP fleet, a
   full HAOS backup restore) - the rough edges above are the real ones that
