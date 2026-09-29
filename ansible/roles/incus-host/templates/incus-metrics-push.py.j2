@@ -41,6 +41,18 @@ def get_metrics_text():
     ).stdout
 
 
+# VMs (not containers) report incus_cpu_seconds_total broken out by full
+# CPU mode - user/system/nice/irq/softirq/steal *and* idle/iowait. Containers
+# only ever emit the active modes (cgroups have no "idle" concept for a
+# single cgroup), so summing every mode blindly worked fine for them, but
+# for a VM it silently added ~1 second of "idle" per real second per vCPU
+# into what was supposed to be "seconds of CPU actually used" - a 2-vCPU VM
+# sitting completely idle would read ~200% busy, a 4-vCPU one ~400%, no
+# matter what it was actually doing. Excluding these two modes fixes it for
+# both VMs and containers (containers never had these labels anyway).
+_CPU_MODES_TO_EXCLUDE = {"idle", "iowait"}
+
+
 def parse_metrics(text):
     """Sum each metric per instance name, across any other labels (cpu core, disk device, etc)."""
     data = {}
@@ -56,6 +68,8 @@ def parse_metrics(text):
                 labels[k] = v.strip('"')
         inst = labels.get("name")
         if not inst:
+            continue
+        if labels.get("mode") in _CPU_MODES_TO_EXCLUDE:
             continue
         bucket = data.setdefault(inst, {})
         bucket[name] = bucket.get(name, 0.0) + float(value)
