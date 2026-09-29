@@ -86,3 +86,12 @@ zfs_arc_max_bytes: 4294967296   # 4GiB
 # network. Needs a matching HA long-lived access token dropped by hand into
 # /etc/incus-metrics-push/ha_token on the host (never committed here).
 ha_url: "http://192.168.0.149:8123"
+
+# Automated backup of ESPHome's device configs (esphome.tf's volume) to a
+# git remote you create and own - deliberately not automated end-to-end,
+# see the esphome-backup tasks in main.yml. Leave blank to skip entirely
+# (no repo, no timer). Push access is via a dedicated deploy key generated
+# on the host - you add its public half (printed during the ansible run,
+# also at /etc/esphome-backup/deploy_key.pub) to the repo yourself, with
+# write access, since the repo and its access grants are yours to control.
+esphome_backup_repo: "git@github.com:ianlunam/esphome-configs.git"

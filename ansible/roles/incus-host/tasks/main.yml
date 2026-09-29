@@ -712,3 +712,151 @@
     name: incus-metrics-push.timer
     enabled: true
     state: started
+
+# --- ESPHome device config backup (optional - only if esphome_backup_repo is set) ---
+# ESPHome's own dashboard already git-inits esphome.tf's config volume for
+# local version history, with a sensible .gitignore of its own (secrets.yaml,
+# build caches, device pairing state) - this only adds pushing that existing
+# history to a remote you create and control yourself. Deliberately NOT
+# automated end-to-end: the repo and who has write access to it are yours to
+# decide, not something to be created on your behalf.
+- name: Install git (for the ESPHome config backup)
+  apt:
+    name: git
+    state: present
+  when: esphome_backup_repo != ""
+
+- name: Create directory for the ESPHome backup deploy key
+  file:
+    path: /etc/esphome-backup
+    state: directory
+    mode: "0700"
+  when: esphome_backup_repo != ""
+
+- name: Generate a dedicated SSH deploy key for the ESPHome config backup
+  command: >
+    ssh-keygen -t ed25519 -f /etc/esphome-backup/deploy_key -N ""
+    -C "esphome-config-backup@{{ ansible_hostname }}"
+  args:
+    creates: /etc/esphome-backup/deploy_key
+  register: esphome_backup_key
+  when: esphome_backup_repo != ""
+
+- name: Show the deploy key's public half to add to your repo
+  debug:
+    msg: >-
+      New deploy key generated - add this to your ESPHome backup repo's
+      Settings > Deploy keys, WITH write access enabled:
+      {{ lookup('file', '/etc/esphome-backup/deploy_key.pub') }}
+  when: esphome_backup_repo != "" and esphome_backup_key.changed
+
+- name: Add an SSH config alias scoped to the ESPHome backup deploy key
+  copy:
+    dest: /etc/ssh/ssh_config.d/esphome-backup.conf
+    mode: "0644"
+    content: |
+      Host github-esphome-backup
+          HostName github.com
+          User git
+          IdentityFile /etc/esphome-backup/deploy_key
+          IdentitiesOnly yes
+          StrictHostKeyChecking accept-new
+  when: esphome_backup_repo != ""
+
+# The push script below runs as root via systemd with no resolvable HOME,
+# so --global config (which some git versions apply per-invoking-user based
+# on HOME) isn't reliable here - --system writes to /etc/gitconfig instead,
+# read regardless of HOME/user context.
+- name: Trust the ESPHome config directory for git (avoids "dubious ownership")
+  command: git config --system --add safe.directory /var/incus-volumes/esphome/config
+  changed_when: true
+  when: esphome_backup_repo != ""
+
+- name: Set a git identity for automated backup commits
+  command: "git config --system {{ item.key }} {{ item.value | quote }}"
+  loop:
+    - { key: "user.name", value: "ESPHome Config Backup" }
+    - { key: "user.email", value: "esphome-backup@{{ ansible_hostname }}.local" }
+  changed_when: true
+  when: esphome_backup_repo != ""
+
+- name: Point the ESPHome config repo's origin at your backup repo
+  command: >
+    git -C /var/incus-volumes/esphome/config remote add origin
+    "{{ esphome_backup_repo | regex_replace('^git@github\.com:', 'git@github-esphome-backup:') }}"
+  register: esphome_backup_remote
+  changed_when: esphome_backup_remote.rc == 0
+  failed_when: esphome_backup_remote.rc != 0 and 'already exists' not in esphome_backup_remote.stderr
+  when: esphome_backup_repo != ""
+
+- name: Deploy the ESPHome config backup push script
+  copy:
+    dest: /etc/esphome-backup/push.sh
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      # Push ESPHome device config changes to the backup remote. The
+      # dashboard already git-inits this directory itself and auto-commits
+      # on every save - most of the time this script's job is just pushing
+      # whatever it already committed. The add+commit here is a fallback
+      # for anything that ended up in the working tree without going
+      # through the dashboard.
+      set -e
+      cd /var/incus-volumes/esphome/config
+
+      git add -A
+      if ! git diff --cached --quiet; then
+          git commit -m "Automated backup $(date -Is)"
+      fi
+
+      if [ -z "$(git log origin/master..master --oneline 2>/dev/null)" ]; then
+          exit 0
+      fi
+
+      git push origin master
+  when: esphome_backup_repo != ""
+
+- name: Install a systemd service for the ESPHome config backup
+  copy:
+    dest: /etc/systemd/system/esphome-backup.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Push ESPHome device config changes to backup remote
+
+      [Service]
+      Type=oneshot
+      ExecStart=/etc/esphome-backup/push.sh
+  register: esphome_backup_unit
+  when: esphome_backup_repo != ""
+
+- name: Install a systemd timer to run the ESPHome config backup every 30 minutes
+  copy:
+    dest: /etc/systemd/system/esphome-backup.timer
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Run esphome-backup every 30 minutes
+
+      [Timer]
+      OnBootSec=5min
+      OnUnitActiveSec=30min
+
+      [Install]
+      WantedBy=timers.target
+  register: esphome_backup_timer
+  when: esphome_backup_repo != ""
+
+- name: Reload systemd after installing the ESPHome backup units
+  systemd:
+    daemon_reload: true
+  when: >
+    esphome_backup_repo != "" and
+    (esphome_backup_unit.changed or esphome_backup_timer.changed)
+
+- name: Enable and start the ESPHome config backup timer
+  systemd:
+    name: esphome-backup.timer
+    enabled: true
+    state: started
+  when: esphome_backup_repo != ""

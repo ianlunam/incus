@@ -60,7 +60,8 @@ ansible/
                                    install/init, docker/ghcr OCI remotes,
                                    GPU profiles, HAOS image import, volume dirs,
                                    Glances + incus-metrics-push (host/GPU/
-                                   per-container monitoring - see below)
+                                   per-container monitoring - see below),
+                                   optional ESPHome config backup (see below)
 terraform/
   provider.tf                  <- Incus provider
   haos.tf                      <- HAOS VM
@@ -354,6 +355,31 @@ toward stock (~150W) and re-run the playbook.
   refreshes cpu-seconds internally every ~8-10s, so two queries a second
   apart are byte-identical every time. Comparing across timer runs (minutes
   apart) sidesteps that and doesn't need the script to block at all.
+  **A bug in this same script briefly made `unifi`/`haos` (the two VMs)
+  read ~200%/~400% CPU** - Incus reports VM CPU time broken out by full
+  mode (`user`/`system`/`nice`/`irq`/`softirq`/`steal` *and* `idle`/
+  `iowait`), since a VM has its own guest-kernel accounting, unlike a
+  container's cgroup (which has no "idle" concept to report at all). The
+  parser summed every mode blindly, so a completely idle N-vCPU VM read
+  ~N x 100% no matter what it was actually doing. Fixed by excluding
+  `idle`/`iowait` from the sum - containers were never affected (they
+  never emit those labels).
+- **ESPHome device config backup** (`esphome_backup_repo` in
+  `group_vars/all.yml`, blank by default = skipped entirely): pushes
+  `esphome.tf`'s config volume to a git remote every 30 minutes via a
+  systemd timer, using a dedicated SSH deploy key generated on the host
+  (`/etc/esphome-backup/deploy_key` - the ansible run prints the public
+  half to add once, if it doesn't already have write access to your
+  repo). Deliberately not automated end-to-end - the repo itself, and who
+  has write access to it, is created and owned by you, not provisioned by
+  this role. ESPHome's own dashboard already `git init`s that directory
+  for local version history on every save, with a sensible `.gitignore`
+  of its own (`secrets.yaml`, build caches, device pairing state) - this
+  only adds pushing that existing history somewhere durable. The backup
+  script also needs `git config --system` (not `--global`) for the
+  repo's `safe.directory` exception and commit identity, since it runs as
+  root via systemd with no resolvable `HOME` for a `--global` config to
+  live in.
 - This has been run end-to-end against real hardware (2x cheap ESP32-CAM
   boards, a Thread/Zigbee dongle, real Matter devices, a UniFi AP fleet, a
   full HAOS backup restore) - the rough edges above are the real ones that
