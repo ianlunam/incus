@@ -762,6 +762,14 @@
   # the actual check for "did this change anything" is the pip output.
   changed_when: "'Successfully installed' in nvidia_ml_py_pip.stdout"
 
+# Glances only takes a stats sample when something requests one, and disk I/O
+# rates (`time_since_update`) need two samples. HA's Glances integration reads
+# that key during *setup* and treats the resulting KeyError as fatal - no
+# retry - so if HA is the first thing to ever query a freshly started Glances
+# (e.g. after a host reboot: Glances up at 10s, HA querying it ~9 minutes
+# later), the integration stays dead until reloaded by hand. The
+# ExecStartPost below takes two samples at startup so a baseline always exists;
+# it holds across idle gaps (verified: still present after 90s unqueried).
 - name: Override Glances' systemd unit to run the REST API instead of the legacy XML-RPC server
   copy:
     dest: /etc/systemd/system/glances.service.d/override.conf
@@ -770,6 +778,7 @@
       [Service]
       ExecStart=
       ExecStart=/usr/bin/glances -w --disable-webui --bind 0.0.0.0 --port 61208
+      ExecStartPost=/bin/sh -c 'for i in $(seq 1 60); do curl -fs -o /dev/null http://127.0.0.1:61208/api/4/status && break; sleep 1; done; sleep 3; curl -s -o /dev/null http://127.0.0.1:61208/api/4/diskio; sleep 3; curl -s -o /dev/null http://127.0.0.1:61208/api/4/diskio'
   register: glances_override
 
 - name: Reload systemd after Glances override change
