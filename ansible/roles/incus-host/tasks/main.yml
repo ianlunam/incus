@@ -123,6 +123,35 @@
 # Zabbly is the Incus project's own upstream apt repo - add it so apt picks
 # up the newer build instead (higher epoch wins automatically, no pinning
 # needed).
+# --- Put Incus's state (database + the ZFS pool file) on the fast disk -------
+# Everything under /var/lib/incus used to live on the HDD mounted at /var,
+# including the file-backed ZFS pool holding every VM/container root disk.
+# Cold boots then took minutes (Incus alone ~190s, host load >10) because two
+# VMs and ten containers all hit one 5400rpm disk at once. Bind-mounting an
+# NVMe directory over the same path keeps every path identical for Incus,
+# ZFS (the pool's `source`) and Terraform. The mount MUST come before the
+# Incus package installs so its state lands on the NVMe.
+- name: Create NVMe backing directory for /var/lib/incus
+  file:
+    path: "{{ nvme_data_root }}/lib"
+    state: directory
+    mode: "0711"
+
+- name: Ensure the /var/lib/incus mountpoint exists
+  file:
+    path: /var/lib/incus
+    state: directory
+    mode: "0711"
+  when: ansible_mounts | selectattr('mount', 'equalto', '/var/lib/incus') | list | length == 0
+
+- name: Bind-mount the NVMe directory over /var/lib/incus
+  mount:
+    path: /var/lib/incus
+    src: "{{ nvme_data_root }}/lib"
+    fstype: none
+    opts: bind
+    state: mounted
+
 - name: Add Zabbly (Incus upstream) apt keyring
   get_url:
     url: https://pkgs.zabbly.com/key.asc
@@ -260,6 +289,24 @@
   register: ghcr_remote
   changed_when: "'already exists' not in (ghcr_remote.stderr | default(''))"
   failed_when: ghcr_remote.rc != 0 and 'already exists' not in ghcr_remote.stderr
+
+# The pool file is sparse with a 300GiB apparent size, but it lives on the
+# NVMe root disk (~217GiB). Without a cap, the pool growing past the free
+# space would hit ENOSPC underneath ZFS, which is far nastier than ZFS itself
+# refusing writes. A quota makes ZFS stop first.
+- name: Read the current ZFS quota on the Incus pool
+  command: "zfs get -H -o value quota {{ incus_storage_pool }}"
+  register: zfs_pool_quota
+  changed_when: false
+  failed_when: false
+  when: incus_storage_driver == 'zfs'
+
+- name: Cap the ZFS pool below the NVMe's capacity
+  command: "zfs set quota={{ nvme_zfs_quota }} {{ incus_storage_pool }}"
+  when:
+    - incus_storage_driver == 'zfs'
+    - zfs_pool_quota.rc == 0
+    - zfs_pool_quota.stdout | trim | upper != nvme_zfs_quota | upper
 
 # --- CUDA userspace libraries for unprivileged containers -------------------
 # Incus's plain "gpu" device only passes through the device nodes (/dev/
@@ -425,6 +472,31 @@
 # "root" is actually a shifted, unpredictable host UID (idmap.base varies per
 # instance) - 0755 root:root left them unwritable from inside the container
 # (ollama/whisper both failed on this exact permission error).
+# Fast-disk volumes: bind-mounted from the NVMe over their /var/incus-volumes
+# paths. Must happen BEFORE the leaf directories below are created, or the
+# mount would shadow them. frigate/media is intentionally not here (large,
+# sequential recordings - what the HDD is good for).
+- name: Create NVMe backing directories for fast volumes
+  file:
+    path: "{{ nvme_data_root }}/volumes/{{ item }}"
+    state: directory
+  loop: "{{ nvme_volume_dirs }}"
+
+- name: Create mountpoints for fast volumes under /var/incus-volumes
+  file:
+    path: "/var/incus-volumes/{{ item }}"
+    state: directory
+  loop: "{{ nvme_volume_dirs }}"
+
+- name: Bind-mount fast volumes from the NVMe
+  mount:
+    path: "/var/incus-volumes/{{ item }}"
+    src: "{{ nvme_data_root }}/volumes/{{ item }}"
+    fstype: none
+    opts: bind
+    state: mounted
+  loop: "{{ nvme_volume_dirs }}"
+
 - name: Create persistent volume directories for the container stack
   file:
     path: "/var/incus-volumes/{{ item }}"
@@ -610,11 +682,23 @@
     - incus-startup
   register: incus_gpu_dropin
 
+# If the bind mount ever failed at boot, Incus would silently start against
+# the empty directory underneath and initialise a brand new, empty state.
+# RequiresMountsFor makes it refuse to start instead.
+- name: Require the /var/lib/incus mount before starting Incus
+  copy:
+    dest: /etc/systemd/system/incus.service.d/20-require-state-mount.conf
+    mode: "0644"
+    content: |
+      [Unit]
+      RequiresMountsFor=/var/lib/incus
+  register: incus_mount_dropin
+
 # Reloads unit files only - doesn't restart incus or touch running instances.
 - name: Reload systemd for the Incus drop-ins
   systemd:
     daemon_reload: true
-  when: incus_gpu_dropin.changed
+  when: incus_gpu_dropin.changed or incus_mount_dropin.changed
 
 # Ollama probes for GPUs once at startup, with a hard 30s watchdog per
 # backend (CUDA 12, CUDA 13, Vulkan). On a cold boot the host is swamped

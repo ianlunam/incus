@@ -278,6 +278,45 @@ toward stock (~150W) and re-run the playbook.
   binary but no unit, so the old enable task silently did nothing and
   `nvidia-power-limits.service` (which `Requires=` it) never ran at boot;
   the role now installs the unit, and `incus`/`incus-startup` wait for both.
+- **Storage layout: Incus state lives on the NVMe, recordings on the HDD.**
+  The root disk is a fast NVMe; `/var` is a 5400rpm HDD. Everything under
+  `/var/lib/incus` - including the file-backed ZFS pool (`disks/default.img`,
+  holding both VMs' disks and every container root) and Incus's database -
+  originally lived on the HDD, so a cold boot had two VMs and ten containers
+  all seeking on one slow disk: `incus.service` alone took ~190s, host load
+  stayed >10 for 10+ minutes, and services with fixed timeouts (Ollama's GPU
+  probe, UniFi's login backend, HA's Glances setup) lost races (see those
+  entries). Measured: the HDD read 12GB and was ~36% busy in the first 50
+  minutes after boot; the NVMe did ~nothing.
+  Now `/srv/incus/lib` is **bind-mounted over `/var/lib/incus`** and
+  `/srv/incus/volumes/<name>` over each `/var/incus-volumes/<name>` (the
+  list is `nvme_volume_dirs` in `group_vars/all.yml`), via `/etc/fstab`
+  entries the `incus-host` role manages. Bind mounts keep every path
+  identical, so Terraform's device `source`s and the pool's own `source`
+  are unchanged. **Frigate's recordings (`frigate/media`) deliberately stay
+  on the HDD** (big sequential writes - what it's good at).
+  Things worth knowing:
+  - `incus.service` has `RequiresMountsFor=/var/lib/incus`: if the bind
+    mount ever fails at boot, Incus refuses to start instead of silently
+    initialising a brand-new empty state in the directory underneath.
+  - The pool file is sparse with a 300GiB apparent size (bigger than the
+    NVMe), so the role sets `zfs set quota=150G default`; ZFS refuses
+    writes before the disk can actually fill.
+  - **Migration is manual, once** (the role only maintains the mounts):
+    stop everything, `rsync -aHAXS --numeric-ids` the directories to
+    `/srv/incus/...`, move the originals aside (`*.premigration`), run the
+    role. Verified with a dry-run rsync (no diffs) and a `zpool scrub` of the
+    copy (0 errors) before switching. The originals
+    (`/var/lib/incus.premigration`, `/var/incus-volumes/*.premigration`) and
+    a backup of the old pool file (`/var/backups/incus-premigration/`) are
+    safe to delete once you're happy - together ~60-100GB. **Rollback** is:
+    stop Incus, remove the bind lines from `/etc/fstab` (the pre-migration
+    copy is `/etc/fstab.pre-nvme-migration`), `umount` them, move the
+    `.premigration` directories back, start Incus.
+  - Why not a native ZFS partition instead of a file on ext4: the NVMe is
+    fully allocated (root + swap), so it would mean an offline shrink of the
+    root filesystem and a rebuilt pool. On NVMe the file-vdev overhead is
+    minor next to what leaving the HDD gained; revisit only if wanted.
 - **MAC addresses and DHCP reservations**: every instance's `eth0` device
   now pins `hwaddr` explicitly to whatever address it already had, so
   router-side DHCP reservations survive future recreation (Incus otherwise

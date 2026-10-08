@@ -36,6 +36,25 @@ incus_storage_pool: default
 incus_storage_driver: zfs        # zfs gives cheap snapshots; use "dir" if no spare disk/space for a zpool
 incus_storage_size: "300GiB"     # only used if incus_storage_driver == zfs and backed by a loop/file device
 
+# The root disk (NVMe) is fast; /var is a spinning HDD. Incus's state and
+# volumes are bind-mounted from the NVMe over their usual /var paths so
+# nothing else (Terraform device sources, Incus's pool `source`) has to change.
+# Frigate's recordings (frigate/media) deliberately stay on the HDD.
+# NOTE the zfs pool file is sparse and "300GiB" apparent size - larger than
+# the NVMe - so the ansible role also caps the pool with a ZFS quota.
+nvme_data_root: /srv/incus
+nvme_zfs_quota: "150G"
+nvme_volume_dirs:               # relative to /var/incus-volumes
+  - mosquitto
+  - ollama
+  - whisper
+  - esphome
+  - piper
+  - matter-server
+  - unifi
+  - searxng
+  - frigate/config
+
 # ---------------------------------------------------------------------------
 # HAOS image (still needed - HAOS runs as an Incus VM)
 # ---------------------------------------------------------------------------
