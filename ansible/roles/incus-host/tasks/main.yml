@@ -512,12 +512,36 @@
     state: started
     daemon_reload: "{{ governor_unit.changed }}"
 
+# Debian's nvidia packages ship the nvidia-persistenced binary but no systemd
+# unit for it (and no service user), so a bare `systemctl enable
+# nvidia-persistenced` silently does nothing - which also left
+# nvidia-power-limits.service below (Requires= this unit) unable to start at
+# boot. Runs as root, which the daemon allows without --user.
+- name: Install nvidia-persistenced systemd unit
+  copy:
+    dest: /etc/systemd/system/nvidia-persistenced.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=NVIDIA Persistence Daemon
+      Wants=syslog.target
+
+      [Service]
+      Type=forking
+      ExecStart=/usr/bin/nvidia-persistenced --verbose
+      ExecStopPost=/bin/rm -rf /var/run/nvidia-persistenced
+      Restart=on-failure
+
+      [Install]
+      WantedBy=multi-user.target
+  register: nvidia_persistenced_unit
+
 - name: Enable nvidia persistence daemon (keeps driver loaded, avoids re-init power/latency spikes)
   systemd:
     name: nvidia-persistenced
     enabled: true
     state: started
-  failed_when: false
+    daemon_reload: "{{ nvidia_persistenced_unit.changed }}"
 
 - name: Cap GTX 1070 power limit
   command: "nvidia-smi -i {{ gpu_1070_pci }} -pl {{ nvidia_1070_power_limit_w }}"
@@ -557,6 +581,41 @@
     enabled: true
     state: started
     daemon_reload: "{{ nvidia_power_unit.changed }}"
+
+# Without this, incus-startup.service (which is what actually boots the
+# boot.autostart instances) races the GPU setup above. Ollama only probes for
+# GPUs once, when it starts - if the GPU isn't fully initialised then, it
+# falls back to CPU and keeps the model there until the container is
+# restarted (seen: qwen2.5:7b at "100% CPU" for 3 days after a host reboot,
+# with the 1070 sitting idle). Ordering the instance autostart after the GPU
+# units avoids that.
+- name: Create drop-in directories for Incus units
+  file:
+    path: "/etc/systemd/system/{{ item }}.service.d"
+    state: directory
+    mode: "0755"
+  loop:
+    - incus
+    - incus-startup
+
+- name: Order Incus instance autostart after the NVIDIA units
+  copy:
+    dest: "/etc/systemd/system/{{ item }}.service.d/10-nvidia-ready.conf"
+    mode: "0644"
+    content: |
+      [Unit]
+      Wants=nvidia-persistenced.service nvidia-power-limits.service
+      After=nvidia-persistenced.service nvidia-power-limits.service
+  loop:
+    - incus
+    - incus-startup
+  register: incus_gpu_dropin
+
+# Reloads unit files only - doesn't restart incus or touch running instances.
+- name: Reload systemd for the Incus drop-ins
+  systemd:
+    daemon_reload: true
+  when: incus_gpu_dropin.changed
 
 - name: Cap ZFS ARC size (skip if not using zfs storage driver)
   copy:

@@ -11,7 +11,8 @@ managed by the same tool:
          share the host's GPU driver, unlike VM passthrough)
       -> Incus
            -> VM:        haos            (Home Assistant OS, no GPU needed)
-           -> container:  frigate         (GPU: 1070 - object detection, onnx/CUDA)
+           -> container:  frigate         (GPU: 1070 - object detection, onnx/CUDA;
+                                            1650 - NVENC recording encode)
            -> container:  ollama          (GPU: 1070 - local LLM for Assist + coding)
            -> container:  whisper         (GPU: 1650 - speech-to-text)
            -> container:  piper           (CPU - text-to-speech; attached to gpu-1650
@@ -216,6 +217,33 @@ toward stock (~150W) and re-run the playbook.
   - Frigate's own `mqtt:` block is mandatory, even if you don't care about
     it - omit it and Frigate silently drops into "safe mode" with your
     camera config ignored, no obvious error pointing at the real cause.
+  - **MJPEG cameras re-encode to H.264 for recording, which is CPU-heavy
+    by default.** Frigate's `preset-record-mjpeg` uses `libx264`: two ESP32
+    cameras cost ~125% of a core in ffmpeg alone, continuously (`mode:
+    motion` only filters what's *kept*, not what's encoded). Recording now
+    uses NVENC on the **1650 SUPER** (Turing - a better H.264 encoder than
+    the 1070's Pascal one, and nearly idle) - Frigate's total dropped to
+    ~20% of a core. Pieces needed, each non-obvious:
+    - `nvidia.driver.capabilities = "compute,video,utility"` on the Frigate
+      instance (`frigate.tf`). Incus's `nvidia.runtime` injects libs per
+      *this* key (default `compute,utility`) and ignores the
+      `NVIDIA_DRIVER_CAPABILITIES` env var Frigate's image sets - without
+      `video`, ffmpeg says `Cannot load libnvidia-encode.so.1`.
+    - The 1650 added to Frigate as a second `gpu` device (`gpu1650` in
+      `frigate.tf`), since the `gpu-1070` profile only exposes the 1070.
+      Detection stays on the 1070. (NVENC on the 1070 works on the host but
+      fails inside the container with `unsupported device`; cause not
+      chased since the 1650 is the better encoder anyway.)
+    - Per camera in Frigate's `config.yml`: `ffmpeg.hwaccel_args: []` and
+      `ffmpeg.output_args.record: -f segment -segment_time 10 -segment_format
+      mp4 -reset_timestamps 1 -strftime 1 -c:v h264_nvenc -gpu 1 -pix_fmt
+      yuv420p -rc vbr -cq 28 -b:v 0 -an`. Frigate *requires* the segment
+      args in any custom record args (it refuses to start otherwise - the
+      preset used to supply them), and `hwaccel_args: []` is needed because
+      once the `video` capability exists Frigate auto-enables CUDA decode,
+      which can't handle these cameras' MJPEG pixel format
+      (`Error reinitializing filters` crash loop). `-cq 28` is the quality
+      knob (lower = better/bigger). Decode stays on the CPU.
 - **GPU device syntax** (`incus profile device add ... gpu pci=<addr>`) is
   correct for Incus's GPU device type but pins the whole card to whichever
   container profile uses it - anything sharing a profile gets concurrent
@@ -228,6 +256,18 @@ toward stock (~150W) and re-run the playbook.
   model that doesn't fit alongside the first evicts it entirely rather than
   splitting across GPU/CPU, so don't expect two large models warm at once
   on one card.
+  **Ollama can silently end up on CPU after a host reboot.** It probes for
+  GPUs once, at startup; if that happens before the GPU is fully
+  initialised it never looks again, and HA's "keep loaded forever" setting
+  keeps the CPU-resident model pinned (seen: `qwen2.5:7b` at "100% CPU" for
+  3 days, 1070 idle, Assist never answering - no error anywhere, just high
+  host CPU). The `incus-host` role now runs `nvidia-persistenced` (Debian
+  ships the binary but no unit - the old task silently did nothing, which
+  also meant the power-limit unit never ran at boot) and orders
+  `incus`/`incus-startup` after the NVIDIA units. This ordering is the
+  intended fix but the original boot-time cause wasn't captured in logs, so
+  after a reboot check `incus exec ollama -- ollama ps` shows `GPU`; if it
+  says `CPU`, `incus restart ollama` and re-send a query.
 - **MAC addresses and DHCP reservations**: every instance's `eth0` device
   now pins `hwaddr` explicitly to whatever address it already had, so
   router-side DHCP reservations survive future recreation (Incus otherwise
@@ -355,6 +395,9 @@ toward stock (~150W) and re-run the playbook.
   refreshes cpu-seconds internally every ~8-10s, so two queries a second
   apart are byte-identical every time. Comparing across timer runs (minutes
   apart) sidesteps that and doesn't need the script to block at all.
+  The counter is cumulative since instance start, so it resets on an
+  instance restart - a negative delta (once showed Frigate at -258,071.5%)
+  is treated as a restart and the new counter value is used as the delta.
   **A bug in this same script briefly made `unifi`/`haos` (the two VMs)
   read ~200%/~400% CPU** - Incus reports VM CPU time broken out by full
   mode (`user`/`system`/`nice`/`irq`/`softirq`/`steal` *and* `idle`/

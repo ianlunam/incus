@@ -13,6 +13,12 @@ resource "incus_instance" "frigate" {
     "limits.cpu"    = "4"
     "limits.memory" = "4GiB"
     "boot.autostart" = "true"
+    # Incus's nvidia.runtime only injects libs for the capabilities named
+    # here (default compute,utility) - it ignores the NVIDIA_DRIVER_CAPABILITIES
+    # env var Frigate's image sets. `video` adds libnvidia-encode/libnvcuvid
+    # so ffmpeg's h264_nvenc works (re-encoding the cameras' MJPEG for
+    # recording on the CPU was the main source of Frigate's load).
+    "nvidia.driver.capabilities" = "compute,video,utility"
     "environment.FRIGATE_RTSP_PASSWORD" = "changeme"
     # Frigate wants /dev/shm sized up for its detection buffers - the LXC
     # default (64MB) isn't enough for more than one camera, and this doesn't
@@ -35,6 +41,19 @@ resource "incus_instance" "frigate" {
   # given explicitly here too, not just inherited) - pinned so router-side
   # DHCP reservations survive future recreation, since Incus otherwise
   # generates a fresh random MAC every time. This one's changed once already.
+  # Second GPU, used only for NVENC recording (ffmpeg `-gpu 1`): the 1650
+  # SUPER is Turing (better H.264 encoder than the 1070's Pascal one) and
+  # nearly idle, while the 1070 is shared with Ollama. Detection stays on the
+  # 1070 via the gpu-1070 profile. pci must match gpu_1650_pci in ansible's
+  # group_vars/all.yml.
+  device {
+    name = "gpu1650"
+    type = "gpu"
+    properties = {
+      pci = "0000:05:00.0"
+    }
+  }
+
   device {
     name = "eth0"
     type = "nic"

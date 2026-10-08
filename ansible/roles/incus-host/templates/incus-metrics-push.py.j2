@@ -133,9 +133,15 @@ def main():
             continue  # instance didn't exist last run (just created)
 
         elapsed = now - previous_state["timestamp"]
-        cpu_delta = metrics.get("incus_cpu_seconds_total", 0.0) - prev_metrics.get(
-            "incus_cpu_seconds_total", 0.0
-        )
+        cpu_now = metrics.get("incus_cpu_seconds_total", 0.0)
+        cpu_delta = cpu_now - prev_metrics.get("incus_cpu_seconds_total", 0.0)
+        if cpu_delta < 0:
+            # The counter is cumulative since instance start, so it drops back
+            # to ~0 when an instance restarts - without this, a restart showed
+            # as a huge negative % (seen: -258,071.5% on Frigate). Everything
+            # in the counter now was used since the restart, i.e. within this
+            # interval, so it's the right delta.
+            cpu_delta = cpu_now
         cpu_pct = round((cpu_delta / elapsed) * 100, 1) if elapsed > 0 else 0.0
 
         try:
