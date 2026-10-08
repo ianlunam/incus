@@ -257,17 +257,27 @@ toward stock (~150W) and re-run the playbook.
   splitting across GPU/CPU, so don't expect two large models warm at once
   on one card.
   **Ollama can silently end up on CPU after a host reboot.** It probes for
-  GPUs once, at startup; if that happens before the GPU is fully
-  initialised it never looks again, and HA's "keep loaded forever" setting
-  keeps the CPU-resident model pinned (seen: `qwen2.5:7b` at "100% CPU" for
-  3 days, 1070 idle, Assist never answering - no error anywhere, just high
-  host CPU). The `incus-host` role now runs `nvidia-persistenced` (Debian
-  ships the binary but no unit - the old task silently did nothing, which
-  also meant the power-limit unit never ran at boot) and orders
-  `incus`/`incus-startup` after the NVIDIA units. This ordering is the
-  intended fix but the original boot-time cause wasn't captured in logs, so
-  after a reboot check `incus exec ollama -- ollama ps` shows `GPU`; if it
-  says `CPU`, `incus restart ollama` and re-send a query.
+  GPUs once, at startup, with a hard 30s watchdog per backend (CUDA 12,
+  CUDA 13, Vulkan) and no env var to extend it. On a cold boot the host is
+  swamped starting the HAOS/UniFi VMs (Incus itself took ~190s to finish
+  starting; load average >10 for 10+ minutes), discovery times out
+  (`llama-server GPU discovery watchdog timed out` in the container's
+  console log), Ollama logs `inference compute id=cpu`, and HA's "keep
+  loaded forever" setting then pins the CPU-resident model indefinitely
+  (seen twice: `qwen2.5:7b` at "100% CPU", 1070 idle, Assist never
+  answering - no error anywhere, just high host CPU). **Ordering Incus after
+  the NVIDIA units did not fix this** (tried first; the driver was already
+  up - it's contention, not readiness). What does: the `incus-host` role
+  installs `ollama-gpu-check.timer` (4 min after boot, then every 5 min),
+  which restarts the `ollama` container if its startup log says
+  `id=cpu` or a loaded model has no VRAM - capped at 3 restarts per boot so
+  a genuinely broken GPU can't flap it forever (logs to the journal:
+  `journalctl -u ollama-gpu-check`). After a self-heal restart nothing is
+  preloaded, so the first Assist query pays a ~35s model load.
+  Side fix from the same investigation: Debian ships the `nvidia-persistenced`
+  binary but no unit, so the old enable task silently did nothing and
+  `nvidia-power-limits.service` (which `Requires=` it) never ran at boot;
+  the role now installs the unit, and `incus`/`incus-startup` wait for both.
 - **MAC addresses and DHCP reservations**: every instance's `eth0` device
   now pins `hwaddr` explicitly to whatever address it already had, so
   router-side DHCP reservations survive future recreation (Incus otherwise

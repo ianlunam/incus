@@ -582,13 +582,12 @@
     state: started
     daemon_reload: "{{ nvidia_power_unit.changed }}"
 
-# Without this, incus-startup.service (which is what actually boots the
-# boot.autostart instances) races the GPU setup above. Ollama only probes for
-# GPUs once, when it starts - if the GPU isn't fully initialised then, it
-# falls back to CPU and keeps the model there until the container is
-# restarted (seen: qwen2.5:7b at "100% CPU" for 3 days after a host reboot,
-# with the 1070 sitting idle). Ordering the instance autostart after the GPU
-# units avoids that.
+# incus-startup.service is what actually boots the boot.autostart instances;
+# make it wait for the persistence daemon and power caps so instances never
+# start against half-initialised GPUs. NOTE: this did NOT fix Ollama landing
+# on CPU after a reboot - that turned out to be GPU discovery hitting
+# Ollama's hard 30s watchdog while the host was swamped booting the VMs (see
+# the ollama-gpu-check units below).
 - name: Create drop-in directories for Incus units
   file:
     path: "/etc/systemd/system/{{ item }}.service.d"
@@ -616,6 +615,96 @@
   systemd:
     daemon_reload: true
   when: incus_gpu_dropin.changed
+
+# Ollama probes for GPUs once at startup, with a hard 30s watchdog per
+# backend (CUDA 12, CUDA 13, Vulkan). On a cold boot the host is swamped
+# starting the HAOS/UniFi VMs (Incus itself took ~190s to finish starting,
+# load average >10 for 10+ minutes), discovery times out, Ollama picks CPU
+# and - since HA keeps the model loaded forever - never looks again. Seen
+# twice, silently (Assist just never answers). No env var extends the
+# watchdog, so instead detect the CPU fallback and restart the container
+# (by then the host has settled). Capped per boot so a genuinely broken GPU
+# can't make this flap forever.
+- name: Install Ollama GPU self-heal check
+  copy:
+    dest: /usr/local/sbin/ollama-gpu-check
+    mode: "0755"
+    content: |
+      #!/bin/bash
+      set -u
+      NAME=ollama
+      STATE=/run/ollama-gpu-check.restarts   # tmpfs - resets every boot
+      MAX=3
+
+      [ "$(incus list "$NAME" -c s -f csv 2>/dev/null)" = "RUNNING" ] || exit 0
+
+      # Ollama logs its GPU discovery result once at startup; the console
+      # log only holds the current run. No line yet = still discovering.
+      last=$(incus console "$NAME" --show-log 2>/dev/null | tr -d '\000' \
+        | grep -a 'msg="inference compute"' | tail -n1)
+      reason=""
+      case "$last" in
+        *"id=cpu"*|*"library=cpu"*) reason="discovery chose CPU" ;;
+      esac
+
+      # Belt and braces if the log line has scrolled out: a model that is
+      # loaded but has nothing in VRAM.
+      if [ -z "$reason" ] && curl -fsS --max-time 10 http://127.0.0.1:11434/api/ps 2>/dev/null \
+        | python3 -c 'import json,sys; m=json.load(sys.stdin).get("models",[]); sys.exit(0 if any(x.get("size",0)>0 and x.get("size_vram",0)==0 for x in m) else 1)'; then
+        reason="loaded model has no VRAM"
+      fi
+
+      [ -n "$reason" ] || exit 0
+
+      n=$(cat "$STATE" 2>/dev/null || echo 0)
+      if [ "$n" -ge "$MAX" ]; then
+        echo "Ollama is on CPU ($reason) but already restarted $n times this boot - giving up"
+        exit 0
+      fi
+      echo $((n + 1)) > "$STATE"
+      echo "Ollama is on CPU ($reason) - restarting container (attempt $((n + 1))/$MAX)"
+      incus restart "$NAME"
+
+- name: Install Ollama GPU self-heal service
+  copy:
+    dest: /etc/systemd/system/ollama-gpu-check.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Restart Ollama if it fell back to CPU inference
+      After=incus.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/ollama-gpu-check
+  register: ollama_gpu_check_service
+
+- name: Install Ollama GPU self-heal timer
+  copy:
+    dest: /etc/systemd/system/ollama-gpu-check.timer
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Periodically check Ollama is using the GPU
+
+      [Timer]
+      OnBootSec=4min
+      OnUnitActiveSec=5min
+
+      [Install]
+      WantedBy=timers.target
+  register: ollama_gpu_check_timer
+
+- name: Reload systemd for the Ollama GPU self-heal units
+  systemd:
+    daemon_reload: true
+  when: ollama_gpu_check_service.changed or ollama_gpu_check_timer.changed
+
+- name: Enable and start the Ollama GPU self-heal timer
+  systemd:
+    name: ollama-gpu-check.timer
+    enabled: true
+    state: started
 
 - name: Cap ZFS ARC size (skip if not using zfs storage driver)
   copy:
