@@ -51,3 +51,21 @@ variable "piper_voice" {
   type        = string
   default     = "en_US-lessac-medium"
 }
+
+variable "mqtt_broker_host" {
+  description = "Address of the Mosquitto broker as reachable from other containers (its bridged DHCP address - pin it with a router reservation, the MAC is fixed in mosquitto.tf). Used by rtl_433."
+  type        = string
+  default     = "192.168.0.134"
+}
+
+variable "rtlsdr_usb_vendor_id" {
+  description = "Vendor ID (hex, no '0x') of the RTL-SDR dongle, from `lsusb` on the host."
+  type        = string
+  default     = "0bda"
+}
+
+variable "rtlsdr_usb_product_id" {
+  description = "Product ID (hex, no '0x') of the RTL-SDR dongle, from `lsusb` on the host."
+  type        = string
+  default     = "2832"
+}

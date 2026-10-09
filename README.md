@@ -19,6 +19,8 @@ managed by the same tool:
                                             profile but doesn't itself use CUDA, Piper
                                             has no GPU inference path)
            -> container:  mosquitto       (CPU only - MQTT broker)
+           -> container:  rtl433          (CPU only - RTL-SDR USB dongle decoding 433 MHz
+                                            sensors, publishes to mosquitto)
            -> container:  searxng         (CPU only - self-hosted web search,
                                             free web/Wikipedia lookups for Ollama)
            -> container:  matter-server   (CPU only - Matter support for Assist)
@@ -69,6 +71,7 @@ terraform/
   frigate.tf, ollama.tf        <- GPU-1070 containers
   whisper-piper.tf             <- GPU-1650 containers
   mosquitto.tf                  <- CPU-only container
+  rtl433.tf                    <- RTL-SDR dongle -> 433 MHz sensor readings -> MQTT
   searxng.tf                   <- self-hosted search (web tool for Ollama, see below)
   esphome.tf                   <- ESPHome dashboard (flash/manage m5stack Atom Echo S3R units)
   unifi.tf                     <- UniFi OS Server (runs as a VM, not a container - see file)
@@ -129,6 +132,28 @@ mapping so you don't end up running the same service twice:
 | OTBR | **Keep as a HAOS add-on** - it needs the Thread/Zigbee USB radio, which this repo passes through directly to the HAOS VM (see `haos.tf`), so OTBR still runs inside HAOS itself, just on the new VM. |
 | motionEye | **Dropped** - Frigate (already in this repo) covers camera detection/recording, so motionEye would just be a redundant consumer of the same camera streams. |
 | nginx SSL Proxy + Let's Encrypt | **Keep as HAOS add-ons** - these front your own static sites (not HA), and HAOS's add-on already automates cert renewal, so there's no reason to re-platform them into a container here. They migrate with the HAOS VM as-is. |
+
+## 433 MHz devices (rtl433)
+
+`rtl433` decodes an RTL-SDR dongle and publishes to Mosquitto under
+`rtl_433/devices/<model>/<id>/...`. Built-in decoders cover many weather
+stations/sensors; a flex decoder in `rtl433.tf` handles a generic EV1527
+fixed-code button (id `9782e`). HA entities are created by retained MQTT
+discovery messages, not YAML - re-publish this if the broker's retained data is
+ever lost:
+
+```
+mosquitto_pub -h <mosquitto-ip> -r -t homeassistant/binary_sensor/rtl433_ev1527_620590/config -m '{"name":"Button","unique_id":"rtl433_ev1527_620590_button","state_topic":"rtl_433/devices/EV1527/620590/button","payload_on":"7","off_delay":2,"availability_topic":"rtl_433/rtl433/availability","device":{"identifiers":["rtl433_ev1527_620590"],"name":"433 MHz button 9782e","manufacturer":"Generic","model":"EV1527 fixed-code remote"}}'
+```
+
+Entity: `binary_sensor.433_mhz_button_9782e_button` (on for 2s per press; one press
+can send two MQTT messages, which `off_delay` absorbs). The "Fairy Lights button" HA automation (created through HA's UI/API, not in
+this repo) triggers on that entity going `on` and runs `light.toggle` on
+`light.dining_room_dining_room_light_switch_switch_3`; the existing "Fairy
+Lights" linked-entities blueprint automation then syncs the two Grillplats plugs.
+To add another remote,
+find its timing with `rtl_433 -A` (stop the `rtl433` container first so the
+dongle is free), then add another `-X` flex spec.
 
 ## Power savings
 
