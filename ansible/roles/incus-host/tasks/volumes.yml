@@ -1,0 +1,67 @@
+# --- Host-side bind-mount directories for container persistent data ---------
+# 0777 because these get bind-mounted into unprivileged OCI containers, whose
+# "root" is actually a shifted, unpredictable host UID (idmap.base varies per
+# instance) - 0755 root:root left them unwritable from inside the container
+# (ollama/whisper both failed on this exact permission error).
+# Fast-disk volumes: bind-mounted from the NVMe over their /var/incus-volumes
+# paths. Must happen BEFORE the leaf directories below are created, or the
+# mount would shadow them. frigate/media is intentionally not here (large,
+# sequential recordings - what the HDD is good for).
+# No mode on the two directory tasks below, deliberately: once bind-mounted,
+# the backing dir IS the volume and the persistent-volume task further down
+# sets it to 0777 - a fixed mode here would flip it back on every run.
+- name: Create NVMe backing directories for fast volumes  # noqa: risky-file-permissions
+  file:
+    path: "{{ nvme_data_root }}/volumes/{{ item }}"
+    state: directory
+  loop: "{{ nvme_volume_dirs }}"
+
+- name: Create mountpoints for fast volumes under /var/incus-volumes  # noqa: risky-file-permissions
+  file:
+    path: "/var/incus-volumes/{{ item }}"
+    state: directory
+  loop: "{{ nvme_volume_dirs }}"
+
+- name: Bind-mount fast volumes from the NVMe
+  ansible.posix.mount:
+    path: "/var/incus-volumes/{{ item }}"
+    src: "{{ nvme_data_root }}/volumes/{{ item }}"
+    fstype: none
+    opts: bind
+    state: mounted
+  loop: "{{ nvme_volume_dirs }}"
+
+- name: Create persistent volume directories for the container stack
+  file:
+    path: "/var/incus-volumes/{{ item }}"
+    state: directory
+    mode: "0777"
+  loop:
+    - mosquitto/config
+    - mosquitto/data
+    - frigate/config
+    - frigate/media
+    - ollama/models
+    - whisper/data
+    - esphome/config
+    - piper/data
+    - matter-server/data
+    - unifi/data
+    - unifi/log
+    - searxng/config
+
+# eclipse-mosquitto has no built-in fallback config once /mosquitto/config is
+# bind-mounted (even empty, it shadows the image's own default) - without a
+# mosquitto.conf here it refuses to start at all ("Unable to open config
+# file"). force: false so a hand-edited config here is never overwritten.
+- name: Write a default mosquitto.conf if one doesn't already exist
+  copy:
+    dest: /var/incus-volumes/mosquitto/config/mosquitto.conf
+    mode: "0644"
+    force: false
+    content: |
+      listener 1883
+      allow_anonymous true
+      persistence true
+      persistence_location /mosquitto/data/
+      log_dest stdout

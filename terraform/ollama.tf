@@ -8,8 +8,8 @@ resource "incus_instance" "ollama" {
   profiles = ["default", "gpu-1070"]
 
   config = {
-    "limits.cpu"    = "4"
-    "limits.memory" = "16GiB"
+    "limits.cpu"     = "4"
+    "limits.memory"  = "16GiB"
     "boot.autostart" = "true"
   }
 
@@ -19,7 +19,7 @@ resource "incus_instance" "ollama" {
     properties = {
       path = "/"
       pool = "default"
-      size = "40GiB"   # model weights add up fast
+      size = "40GiB" # model weights add up fast
     }
   }
 

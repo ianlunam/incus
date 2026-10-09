@@ -99,7 +99,7 @@ nvidia_1650_power_limit_w: 70    # this card is a 1650 SUPER, not a non-Ti - nvi
 # on a home-NVR-scale workload. Only applies if incus_storage_driver == zfs.
 zfs_arc_max_bytes: 4294967296   # 4GiB
 
-# Used by the incus-metrics-push service (see main.yml) to push per-instance
+# Used by the incus-metrics-push service (see tasks/monitoring.yml) to push per-instance
 # CPU/memory stats to HA's own REST API - no https_address/client-cert setup
 # needed since it reads Incus's metrics over the local unix socket, not the
 # network. Needs a matching HA long-lived access token dropped by hand into
@@ -108,7 +108,7 @@ ha_url: "http://192.168.0.149:8123"
 
 # Automated backup of ESPHome's device configs (esphome.tf's volume) to a
 # git remote you create and own - deliberately not automated end-to-end,
-# see the esphome-backup tasks in main.yml. Leave blank to skip entirely
+# see the esphome-backup tasks in tasks/esphome-backup.yml. Leave blank to skip entirely
 # (no repo, no timer). Push access is via a dedicated deploy key generated
 # on the host - you add its public half (printed during the ansible run,
 # also at /etc/esphome-backup/deploy_key.pub) to the repo yourself, with

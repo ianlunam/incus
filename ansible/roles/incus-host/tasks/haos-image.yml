@@ -1,0 +1,56 @@
+# --- HAOS image, imported for Incus VM use ----------------------------------
+- name: Ensure image directory exists
+  file:
+    path: "{{ haos_download_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Download HAOS qcow2.xz image
+  get_url:
+    url: "{{ haos_image_url }}"
+    dest: "{{ haos_download_dir }}/{{ haos_qcow2_name }}.xz"
+    mode: "0644"
+    timeout: 600
+
+- name: Decompress HAOS image
+  command: "xz -dk -T0 {{ haos_download_dir }}/{{ haos_qcow2_name }}.xz"
+  args:
+    creates: "{{ haos_download_dir }}/{{ haos_qcow2_name }}"
+
+- name: Check if HAOS image is already imported into Incus
+  command: incus image list haos -f csv
+  register: haos_image_check
+  changed_when: false
+
+# A bare qcow2 isn't a valid Incus image on its own - "incus image import"
+# expects a metadata tarball (with metadata.yaml) plus the actual disk image
+# as a second, separate argument. Without the metadata.yaml, Incus can't tell
+# it's meant to boot as a VM at all ("Metadata tarball is missing metadata.yaml").
+- name: Write HAOS image metadata.yaml
+  copy:
+    dest: "{{ haos_download_dir }}/metadata.yaml"
+    mode: "0644"
+    content: |
+      architecture: x86_64
+      creation_date: {{ ansible_date_time.epoch }}
+      properties:
+        architecture: x86_64
+        os: HAOS
+        release: "{{ haos_version }}"
+        description: Home Assistant OS {{ haos_version }}
+  when: haos_image_check.stdout == ""
+
+- name: Package HAOS image metadata into a tarball
+  command: >
+    tar -cJf {{ haos_download_dir }}/metadata.tar.xz
+    -C {{ haos_download_dir }} metadata.yaml
+  args:
+    creates: "{{ haos_download_dir }}/metadata.tar.xz"
+  when: haos_image_check.stdout == ""
+
+- name: Import HAOS qcow2 as a local Incus image alias "haos"
+  command: >
+    incus image import {{ haos_download_dir }}/metadata.tar.xz
+    {{ haos_download_dir }}/{{ haos_qcow2_name }}
+    --alias haos
+  when: haos_image_check.stdout == ""

@@ -1,0 +1,147 @@
+# --- Host monitoring: Glances (host stats) + Incus metrics (per-instance) ---
+# Glances runs directly on the host, not in a container - monitoring "the
+# host" from inside a container would only ever show that container's own
+# cgroup-limited view, not true host-wide CPU/memory/GPU stats.
+- name: Install Glances and its non-GPU dependencies
+  apt:
+    name:
+      - glances
+      - lm-sensors
+      - python3-pip
+      # Debian's glances package doesn't pull this in, but web/API mode
+      # needs it (fails at startup with "jinja2 must be installed" without
+      # it) - also the Debian package is a "+dfsg" repackage that strips the
+      # WebUI's bundled static assets, hence --disable-webui below rather
+      # than trying to fix that; we only need the REST API for HA anyway.
+      - python3-jinja2
+    state: present
+
+# Do NOT `apt install python3-pynvml` for GPU support - it depends on
+# Debian's own libnvidia-ml1 (driver 550.163.01), which drags in
+# nvidia-alternative/glx-alternative-nvidia/nvidia-installer-cleanup - a
+# whole apt-managed driver stack that conflicts with the .run-installed 580
+# driver these GPUs actually need (nvidia-installer-cleanup's entire job is
+# finding and removing exactly that kind of install). Hit this directly:
+# the postinst script failed non-interactively before doing anything
+# destructive, but don't rely on that - avoid the apt package entirely.
+# nvidia-ml-py is a pure ctypes wrapper with no bundled library of its own -
+# it dlopens whatever libnvidia-ml.so.1 is already on the system (the
+# working .run-installed one), so pip installing just this is safe.
+- name: Install nvidia-ml-py via pip for Glances' GPU plugin (not via apt - see above)
+  command: python3 -m pip install --break-system-packages nvidia-ml-py
+  args:
+    creates: /usr/lib/python3/dist-packages/pynvml/__init__.py
+  register: nvidia_ml_py_pip
+  # dist-packages is where apt's python3 would look, but pip installs to
+  # /usr/local/lib - "creates" above never matches, so this always runs;
+  # harmless (pip itself is idempotent/no-ops when already installed), but
+  # the actual check for "did this change anything" is the pip output.
+  changed_when: "'Successfully installed' in nvidia_ml_py_pip.stdout"
+
+# Glances only takes a stats sample when something requests one, and disk I/O
+# rates (`time_since_update`) need two samples. HA's Glances integration reads
+# that key during *setup* and treats the resulting KeyError as fatal - no
+# retry - so if HA is the first thing to ever query a freshly started Glances
+# (e.g. after a host reboot: Glances up at 10s, HA querying it ~9 minutes
+# later), the integration stays dead until reloaded by hand. The
+# ExecStartPost below takes two samples at startup so a baseline always exists;
+# it holds across idle gaps (verified: still present after 90s unqueried).
+- name: Override Glances' systemd unit to run the REST API instead of the legacy XML-RPC server
+  copy:
+    dest: /etc/systemd/system/glances.service.d/override.conf
+    mode: "0644"
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=/usr/bin/glances -w --disable-webui --bind 0.0.0.0 --port 61208
+      ExecStartPost=/bin/sh -c 'for i in $(seq 1 60); do curl -fs -o /dev/null http://127.0.0.1:61208/api/4/status && break; sleep 1; done; sleep 3; curl -s -o /dev/null http://127.0.0.1:61208/api/4/diskio; sleep 3; curl -s -o /dev/null http://127.0.0.1:61208/api/4/diskio'
+  register: glances_override
+
+- name: Reload systemd after Glances override change
+  systemd:
+    daemon_reload: true
+  when: glances_override.changed
+
+- name: Enable and start Glances
+  systemd:
+    name: glances
+    enabled: true
+    state: "{{ 'restarted' if glances_override.changed else 'started' }}"
+
+# Per-container CPU/memory via Incus's own /1.0/metrics endpoint. Pulling
+# this into HA (a REST sensor querying Incus directly) turned out not to be
+# possible: it needs Incus's HTTPS API exposed to the network
+# (core.https_address, off by default) AND a client certificate for every
+# request (no anonymous access), and HA's core `rest` integration has no way
+# to present a client cert at all. Pushing instead sidesteps both problems -
+# this script reads /1.0/metrics over the LOCAL unix socket (same access
+# `incus` CLI commands always have, no network/cert story needed at all) and
+# posts parsed values straight to HA's own REST API. Glances above already
+# covers per-container *disk* usage for free (each container's ZFS dataset
+# is its own mount point, discovered by Glances' disk plugin on its own) -
+# this fills in the CPU/memory gap Glances can't see per-container.
+- name: Create directory for the Incus metrics push script and token
+  file:
+    path: /etc/incus-metrics-push
+    state: directory
+    mode: "0700"
+
+- name: Deploy the Incus metrics push script
+  template:
+    src: incus-metrics-push.py.j2
+    dest: /etc/incus-metrics-push/push.py
+    mode: "0755"
+
+# The token itself is a secret and never templated/committed here - this
+# just makes sure the expected path exists with locked-down permissions so
+# it's obvious where to put it. Get a long-lived access token from your HA
+# user profile (bottom of the page) and write it to this file with no
+# trailing newline. force: false so a token already placed here survives
+# reruns.
+- name: Create a placeholder for the HA long-lived access token, if absent
+  copy:
+    dest: /etc/incus-metrics-push/ha_token
+    mode: "0600"
+    force: false
+    content: |
+      REPLACE_ME_WITH_A_HOME_ASSISTANT_LONG_LIVED_ACCESS_TOKEN
+
+- name: Install a systemd service for the Incus metrics push script
+  copy:
+    dest: /etc/systemd/system/incus-metrics-push.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Push per-instance Incus stats to Home Assistant
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/python3 /etc/incus-metrics-push/push.py
+  register: incus_metrics_push_unit
+
+- name: Install a systemd timer to run the Incus metrics push every 2 minutes
+  copy:
+    dest: /etc/systemd/system/incus-metrics-push.timer
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Run incus-metrics-push every 2 minutes
+
+      [Timer]
+      OnBootSec=2min
+      OnUnitActiveSec=2min
+
+      [Install]
+      WantedBy=timers.target
+  register: incus_metrics_push_timer
+
+- name: Reload systemd after installing the Incus metrics push units
+  systemd:
+    daemon_reload: true
+  when: incus_metrics_push_unit.changed or incus_metrics_push_timer.changed
+
+- name: Enable and start the Incus metrics push timer
+  systemd:
+    name: incus-metrics-push.timer
+    enabled: true
+    state: started

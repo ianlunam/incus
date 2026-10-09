@@ -1,0 +1,73 @@
+# --- Bridged networking (same as before - Incus attaches to this bridge) ----
+# Without bridge-utils, ifupdown creates br0 and assigns it an IP but never
+# actually enslaves bridge_ports's physical NIC to it - the bridge ends up
+# with no uplink and can reach nothing. Also load the "bridge" kernel module
+# explicitly at boot (modules-load.d) rather than relying on it having been
+# auto-loaded by something else already, which isn't guaranteed on a cold boot.
+- name: Install bridge-utils (needed for ifupdown's bridge_ports support)
+  apt:
+    name: bridge-utils
+    state: present
+
+- name: Ensure the bridge kernel module is loaded at boot, before networking starts
+  copy:
+    dest: /etc/modules-load.d/bridge.conf
+    mode: "0644"
+    content: |
+      bridge
+
+- name: Load the bridge kernel module now
+  community.general.modprobe:
+    name: bridge
+    state: present
+
+- name: Configure bridge via /etc/network/interfaces (ifupdown)
+  template:
+    src: interfaces.j2
+    dest: /etc/network/interfaces
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+  when: not use_netplan
+  notify: apply networking changes
+
+- name: Flush handlers so the bridge is up before Incus is configured
+  meta: flush_handlers
+
+# Restarting networking tears down and rebuilds br0 as a fresh kernel object -
+# fine for the physical NIC (re-enslaved automatically), but any instance's
+# tap (VMs) or veth (containers) was only ever plugged into the OLD bridge
+# when it started, and doesn't get replugged into the new one - silently
+# cutting it off from the network while it keeps running. This affects BOTH
+# VMs and containers (verified: checking reachability through a host-proxied
+# port isn't a valid test, since those tunnel via loopback inside the
+# instance's own netns and work even with eth0 fully disconnected from the
+# bridge). Re-attach unconditionally - harmless no-op if already attached.
+- name: Re-attach any instance tap/veth devices dropped by the networking restart
+  shell: |
+    for dev in $(ls /sys/class/net/ 2>/dev/null | grep -E '^(tap|veth)'); do
+      ip link set "$dev" master {{ bridge_name }}
+    done
+  changed_when: false
+  when: not use_netplan
+
+# The above only fixes what's ALREADY disconnected at the moment this
+# playbook runs. Separately confirmed that restarting a single instance
+# (independent of any host networking change) also leaves its new tap/veth
+# unattached - Incus's own bridge attachment for this device type isn't
+# reliable on this host. A udev rule closes that gap permanently: it fires
+# the instant any such device appears, with no dependency on ansible having
+# run recently.
+- name: Install udev rule to auto-attach tap/veth devices to the bridge
+  template:
+    src: 99-incus-bridge-attach.rules.j2
+    dest: /etc/udev/rules.d/99-incus-bridge-attach.rules
+    owner: root
+    group: root
+    mode: "0644"
+  register: udev_bridge_rule
+
+- name: Reload udev rules so the new rule takes effect immediately
+  command: udevadm control --reload-rules
+  when: udev_bridge_rule.changed

@@ -1,0 +1,30 @@
+# =============================================================================
+# RTL-SDR dongle (rtl433 container)
+# =============================================================================
+# The kernel's DVB-T drivers bind any RTL2832U dongle as a TV tuner, which
+# stops rtl_433 (userspace, via libusb) from opening it - and containers
+# share the host kernel, so this has to be fixed here, not in the container.
+- name: Blacklist the DVB-T kernel drivers that claim RTL-SDR dongles
+  copy:
+    dest: /etc/modprobe.d/blacklist-rtl-sdr.conf
+    mode: "0644"
+    content: |
+      blacklist dvb_usb_rtl28xxu
+      blacklist rtl2832
+      blacklist rtl2832_sdr
+      blacklist rtl2830
+      blacklist r820t
+      blacklist e4000
+      blacklist fc0012
+      blacklist fc0013
+
+- name: Unload the DVB-T drivers now so the dongle is free without a reboot
+  shell: |
+    if lsmod | grep -q '^{{ item }} '; then modprobe -r {{ item }} && echo unloaded; fi
+  loop:
+    - rtl2832_sdr
+    - dvb_usb_rtl28xxu
+    - rtl2832
+  register: rtlsdr_unload
+  changed_when: "'unloaded' in rtlsdr_unload.stdout"
+  failed_when: false

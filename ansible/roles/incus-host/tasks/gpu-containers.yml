@@ -1,0 +1,101 @@
+# --- CUDA userspace libraries for unprivileged containers -------------------
+# Incus's plain "gpu" device only passes through the device nodes (/dev/
+# nvidia0 etc) - it does NOT inject the host's driver userspace libraries
+# (libcuda.so) into the container the way Docker's --gpus flag does. Without
+# this, any CUDA-using process in the container fails with a misleading
+# "CUDA driver version is insufficient for CUDA runtime version" error even
+# though the host driver is fine - onnxruntime (Frigate) hit this, and
+# presumably Ollama would too under real load, since it was never actually
+# confirmed to be doing GPU inference (no model was ever pulled into it).
+# nvidia-container-toolkit/libnvidia-container provides the pieces Incus's
+# own `nvidia.runtime` container config key needs to fix this.
+- name: Add NVIDIA container toolkit apt keyring
+  get_url:
+    url: https://nvidia.github.io/libnvidia-container/gpgkey
+    dest: /tmp/nvidia-container-toolkit-key.asc
+    mode: "0644"
+
+- name: Dearmor the NVIDIA container toolkit key
+  command: gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg /tmp/nvidia-container-toolkit-key.asc
+  args:
+    creates: /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+- name: Add NVIDIA container toolkit apt repo
+  get_url:
+    url: https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list
+    dest: /tmp/nvidia-container-toolkit.list.raw
+    mode: "0644"
+
+- name: Rewrite the repo list to reference the local signing key
+  command: >
+    sed -i 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g'
+    /tmp/nvidia-container-toolkit.list.raw
+  changed_when: true
+
+- name: Install the rewritten NVIDIA container toolkit repo list
+  copy:
+    src: /tmp/nvidia-container-toolkit.list.raw
+    dest: /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    remote_src: true
+    mode: "0644"
+  register: nvct_repo
+
+- name: Update apt cache after adding NVIDIA container toolkit repo
+  apt:
+    update_cache: true
+  when: nvct_repo.changed
+
+- name: Install nvidia-container-toolkit
+  apt:
+    name:
+      - nvidia-container-toolkit
+      - nvidia-container-toolkit-base
+      - libnvidia-container-tools
+      - libnvidia-container1
+    state: present
+
+# --- GPU profiles: one per card, applied per-instance in Terraform ----------
+- name: Create incus profile exposing the 1070 (detection/LLM card)
+  command: >
+    incus profile create gpu-1070
+  register: profile_1070
+  changed_when: "'already exists' not in (profile_1070.stderr | default(''))"
+  failed_when: profile_1070.rc != 0 and 'already exists' not in profile_1070.stderr
+
+- name: Attach the 1070 GPU device to its profile
+  command: >
+    incus profile device add gpu-1070 gpu gpu pci={{ gpu_1070_pci }}
+  register: dev_1070
+  changed_when: "'already exists' not in (dev_1070.stderr | default(''))"
+  failed_when: dev_1070.rc != 0 and 'already exists' not in dev_1070.stderr
+
+- name: Enable the NVIDIA container runtime on the 1070 profile
+  command: incus profile set gpu-1070 nvidia.runtime true
+  changed_when: true
+
+- name: Create incus profile exposing the 1650 (voice pipeline card)
+  command: >
+    incus profile create gpu-1650
+  register: profile_1650
+  changed_when: "'already exists' not in (profile_1650.stderr | default(''))"
+  failed_when: profile_1650.rc != 0 and 'already exists' not in profile_1650.stderr
+
+- name: Attach the 1650 GPU device to its profile
+  command: >
+    incus profile device add gpu-1650 gpu gpu pci={{ gpu_1650_pci }}
+  register: dev_1650
+  changed_when: "'already exists' not in (dev_1650.stderr | default(''))"
+  failed_when: dev_1650.rc != 0 and 'already exists' not in dev_1650.stderr
+
+- name: Enable the NVIDIA container runtime on the 1650 profile
+  command: incus profile set gpu-1650 nvidia.runtime true
+  changed_when: true
+
+- name: Verify nvidia driver sees both cards
+  command: nvidia-smi -L
+  register: nvidia_check
+  changed_when: false
+
+- name: Show detected GPUs
+  debug:
+    var: nvidia_check.stdout_lines

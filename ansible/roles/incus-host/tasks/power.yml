@@ -1,0 +1,137 @@
+# =============================================================================
+# Power savings
+# =============================================================================
+- name: Install power-management tooling
+  apt:
+    name:
+      - tlp
+      - linux-cpupower
+    state: present
+  when: enable_tlp
+
+- name: Enable and start TLP
+  systemd:
+    name: tlp
+    enabled: true
+    state: started
+  when: enable_tlp
+
+- name: Mask power-profiles-daemon (conflicts with TLP if present)
+  systemd:
+    name: power-profiles-daemon
+    masked: true
+    enabled: false
+    state: stopped
+  when: enable_tlp
+  failed_when: false
+
+- name: Set CPU governor persistently via systemd unit
+  copy:
+    dest: /etc/systemd/system/cpu-governor.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Set CPU frequency governor
+      After=multi-user.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/cpupower frequency-set -g {{ cpu_governor }}
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+  register: governor_unit
+
+- name: Enable and start cpu-governor unit
+  systemd:
+    name: cpu-governor
+    enabled: true
+    state: started
+    daemon_reload: "{{ governor_unit.changed }}"
+
+# Debian's nvidia packages ship the nvidia-persistenced binary but no systemd
+# unit for it (and no service user), so a bare `systemctl enable
+# nvidia-persistenced` silently does nothing - which also left
+# nvidia-power-limits.service below (Requires= this unit) unable to start at
+# boot. Runs as root, which the daemon allows without --user.
+- name: Install nvidia-persistenced systemd unit
+  copy:
+    dest: /etc/systemd/system/nvidia-persistenced.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=NVIDIA Persistence Daemon
+      Wants=syslog.target
+
+      [Service]
+      Type=forking
+      ExecStart=/usr/bin/nvidia-persistenced --verbose
+      ExecStopPost=/bin/rm -rf /var/run/nvidia-persistenced
+      Restart=on-failure
+
+      [Install]
+      WantedBy=multi-user.target
+  register: nvidia_persistenced_unit
+
+- name: Enable nvidia persistence daemon (keeps driver loaded, avoids re-init power/latency spikes)
+  systemd:
+    name: nvidia-persistenced
+    enabled: true
+    state: started
+    daemon_reload: "{{ nvidia_persistenced_unit.changed }}"
+
+- name: Cap GTX 1070 power limit
+  command: "nvidia-smi -i {{ gpu_1070_pci }} -pl {{ nvidia_1070_power_limit_w }}"
+  register: pl_1070
+  changed_when: "'Power limit for GPU' in pl_1070.stdout"
+  failed_when: false
+
+- name: Cap GTX 1650 power limit
+  command: "nvidia-smi -i {{ gpu_1650_pci }} -pl {{ nvidia_1650_power_limit_w }}"
+  register: pl_1650
+  changed_when: "'Power limit for GPU' in pl_1650.stdout"
+  failed_when: false
+
+- name: Persist GPU power caps across reboots via systemd unit
+  copy:
+    dest: /etc/systemd/system/nvidia-power-limits.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Apply NVIDIA GPU power limits
+      After=nvidia-persistenced.service
+      Requires=nvidia-persistenced.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/nvidia-smi -i {{ gpu_1070_pci }} -pl {{ nvidia_1070_power_limit_w }}
+      ExecStart=/usr/bin/nvidia-smi -i {{ gpu_1650_pci }} -pl {{ nvidia_1650_power_limit_w }}
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+  register: nvidia_power_unit
+
+- name: Enable nvidia-power-limits unit
+  systemd:
+    name: nvidia-power-limits
+    enabled: true
+    state: started
+    daemon_reload: "{{ nvidia_power_unit.changed }}"
+
+- name: Cap ZFS ARC size (skip if not using zfs storage driver)
+  copy:
+    dest: /etc/modprobe.d/zfs-arc.conf
+    mode: "0644"
+    content: |
+      options zfs zfs_arc_max={{ zfs_arc_max_bytes }}
+  when: incus_storage_driver == "zfs"
+  register: zfs_arc_conf
+
+- name: Apply ZFS ARC max immediately (module param, avoids waiting for reboot)
+  command: >
+    bash -c "echo {{ zfs_arc_max_bytes }} > /sys/module/zfs/parameters/zfs_arc_max"
+  when: incus_storage_driver == "zfs"
+  changed_when: false
+  failed_when: false

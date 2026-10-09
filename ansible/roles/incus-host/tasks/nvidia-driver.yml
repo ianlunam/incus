@@ -1,0 +1,50 @@
+# --- Base packages ----------------------------------------------------------
+# Both contrib and non-free-firmware are needed for nvidia-smi/firmware, but
+# the actual proprietary driver+kernel module (nvidia-driver, nvidia-kernel-dkms)
+# lives in plain non-free - non-free-firmware alone only covers firmware blobs.
+- name: Enable contrib, non-free and non-free-firmware components (needed for nvidia driver on Debian 13)
+  replace:
+    path: /etc/apt/sources.list
+    regexp: '^(deb(-src)? .*\bmain)( contrib)?( non-free)?( non-free-firmware)?$'
+    replace: '\1 contrib non-free non-free-firmware'
+
+- name: Update apt cache after sources change
+  apt:
+    update_cache: true
+
+# Needed so DKMS can actually build the nvidia and zfs kernel modules below -
+# without matching headers, both packages install "successfully" but leave
+# their module in dkms status "added" (never built), so modprobe fails later.
+- name: Install kernel headers for DKMS module builds (nvidia, zfs)
+  apt:
+    name: linux-headers-amd64
+    state: present
+
+- name: Check if an NVIDIA driver is already active on the host
+  command: nvidia-smi --query-gpu=driver_version --format=csv,noheader
+  register: nvidia_driver_check
+  changed_when: false
+  failed_when: false
+
+# incus-01 currently runs 580.178.04 installed by hand from NVIDIA's official
+# .run installer (https://download.nvidia.com/XFree86/Linux-x86_64/580.178.04/),
+# not this apt package - `dpkg -l | grep nvidia` is empty. That was needed
+# because Frigate's onnxruntime-gpu requires CUDA 12.8 / driver >=570, newer
+# than what was in the apt repo at the time. Installing nvidia-driver here
+# regardless would fight the .run installer's files (mismatched kernel module
+# vs userspace library versions, DKMS rebuilding the wrong version), so this
+# only runs when no driver is present at all - if you need to move off the
+# .run install, remove it first (nvidia-uninstall) and rerun this play.
+- name: Install nvidia driver + CUDA runtime bits on the host
+  apt:
+    name:
+      - "{{ nvidia_driver_package }}"
+      - nvidia-smi
+    state: present
+  when: nvidia_driver_check.rc != 0
+
+# Debian's own repo pins Incus at 6.0.4, which predates native OCI support
+# (the "docker:" image references throughout terraform/ need Incus >= 6.1).
+# Zabbly is the Incus project's own upstream apt repo - add it so apt picks
+# up the newer build instead (higher epoch wins automatically, no pinning
+# needed).

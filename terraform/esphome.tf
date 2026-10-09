@@ -1,6 +1,6 @@
 # ESPHome dashboard - used to build/flash firmware for ESPHome devices,
 # including the m5stack Atom Echo S3R voice satellite units (see the note
-# in outputs.tf / README for how those units themselves get configured).
+# in outputs.tf / docs/services.md for how those units themselves get configured).
 # CPU only. Bridged (not proxied) because first-time USB flashing from the
 # dashboard's web UI plus over-the-air updates both expect it to be able to
 # reach devices directly on the LAN, and mDNS discovery of already-flashed
@@ -15,8 +15,8 @@ resource "incus_instance" "esphome" {
     # Bumped from 1 CPU / 1GiB - PlatformIO firmware builds (triggered from
     # the dashboard or OTA pushes) are genuinely CPU/RAM-hungry compile jobs,
     # not part of the otherwise-idle dashboard's normal footprint.
-    "limits.cpu"    = "6"
-    "limits.memory" = "6GiB"
+    "limits.cpu"     = "6"
+    "limits.memory"  = "6GiB"
     "boot.autostart" = "true"
   }
 

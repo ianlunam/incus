@@ -16,9 +16,9 @@ resource "incus_instance" "haos" {
   type  = "virtual-machine"
 
   config = {
-    "limits.cpu"      = "4"
-    "limits.memory"   = "4GiB"
-    "boot.autostart"  = "true"
+    "limits.cpu"          = "4"
+    "limits.memory"       = "4GiB"
+    "boot.autostart"      = "true"
     "security.secureboot" = "false"
   }
 

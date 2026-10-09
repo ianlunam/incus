@@ -15,3 +15,8 @@ crash.log
 # a specific GitHub account, kept separate from other gh/git sessions on
 # this machine - holds a live token, never committed.
 .gh-config-ianlunam/
+
+# Test/lint caches
+.cache/
+.pytest_cache/
+__pycache__/

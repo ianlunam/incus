@@ -10,8 +10,8 @@ resource "incus_instance" "matter_server" {
   profiles = ["default"]
 
   config = {
-    "limits.cpu"    = "1"
-    "limits.memory" = "1GiB"
+    "limits.cpu"     = "1"
+    "limits.memory"  = "1GiB"
     "boot.autostart" = "true"
     # Kernel default (0) discards the Route Information Option in Router
     # Advertisements, so this container never learns OTBR's Thread route no

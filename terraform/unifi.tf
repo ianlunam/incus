@@ -31,8 +31,8 @@ resource "incus_instance" "unifi" {
   type  = "virtual-machine"
 
   config = {
-    "limits.cpu"    = "2"
-    "limits.memory" = "4GiB"
+    "limits.cpu"     = "2"
+    "limits.memory"  = "4GiB"
     "boot.autostart" = "true"
     # Despite the ".deb" naming convention on Ubiquiti's download page, this
     # is actually a self-contained ELF installer binary, not a real .deb -

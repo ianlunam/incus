@@ -1,0 +1,184 @@
+# --- Put Incus's state (database + the ZFS pool file) on the fast disk -------
+# Everything under /var/lib/incus used to live on the HDD mounted at /var,
+# including the file-backed ZFS pool holding every VM/container root disk.
+# Cold boots then took minutes (Incus alone ~190s, host load >10) because two
+# VMs and ten containers all hit one 5400rpm disk at once. Bind-mounting an
+# NVMe directory over the same path keeps every path identical for Incus,
+# ZFS (the pool's `source`) and Terraform. The mount MUST come before the
+# Incus package installs so its state lands on the NVMe.
+- name: Create NVMe backing directory for /var/lib/incus
+  file:
+    path: "{{ nvme_data_root }}/lib"
+    state: directory
+    mode: "0711"
+
+- name: Ensure the /var/lib/incus mountpoint exists
+  file:
+    path: /var/lib/incus
+    state: directory
+    mode: "0711"
+  when: ansible_mounts | selectattr('mount', 'equalto', '/var/lib/incus') | list | length == 0
+
+- name: Bind-mount the NVMe directory over /var/lib/incus
+  ansible.posix.mount:
+    path: /var/lib/incus
+    src: "{{ nvme_data_root }}/lib"
+    fstype: none
+    opts: bind
+    state: mounted
+
+- name: Add Zabbly (Incus upstream) apt keyring
+  get_url:
+    url: https://pkgs.zabbly.com/key.asc
+    dest: /etc/apt/keyrings/zabbly.asc
+    mode: "0644"
+
+- name: Add Zabbly Incus stable apt repo
+  copy:
+    dest: /etc/apt/sources.list.d/zabbly-incus-stable.sources
+    mode: "0644"
+    content: |
+      Enabled: yes
+      Types: deb
+      URIs: https://pkgs.zabbly.com/incus/stable
+      Suites: {{ ansible_distribution_release }}
+      Components: main
+      Architectures: {{ ansible_architecture | regex_replace('x86_64', 'amd64') }}
+      Signed-By: /etc/apt/keyrings/zabbly.asc
+  register: zabbly_repo
+
+- name: Update apt cache after adding Zabbly repo
+  apt:
+    update_cache: true
+  when: zabbly_repo.changed
+
+- name: Install Incus and its container tooling
+  apt:
+    name:
+      - incus
+      - incus-client
+      - zfsutils-linux
+    state: present
+
+- name: Enable and start incus daemon
+  systemd:
+    name: incus
+    enabled: true
+    state: started
+
+- name: Add ansible_user to incus-admin group
+  user:
+    name: "{{ ansible_user }}"
+    groups: incus-admin
+    append: true
+
+# Headers are now present, but nvidia-kernel-dkms/zfs-dkms may have already
+# been installed (this run or a prior one) without them, leaving their
+# modules registered but never compiled ("dkms status" shows "added", not
+# "installed"). Build/load them now instead of waiting for a reboot.
+- name: Build any pending DKMS modules (nvidia, zfs) now that headers are present
+  command: dkms autoinstall
+  register: dkms_autoinstall
+  changed_when: "'Building module' in dkms_autoinstall.stdout or 'Module build for' in dkms_autoinstall.stdout"
+
+# The nvidia packages drop a modprobe blacklist for nouveau, but that only
+# stops it loading on a FUTURE boot - if nouveau is already bound to the
+# GPUs (e.g. from before this playbook ran, or the box's very first boot),
+# it has to go before nvidia can claim the same devices. Regenerating the
+# initramfs plus one reboot is the reliable way to do that; hot-unloading
+# nouveau from a live system is fragile (DRM/console references, etc.).
+# Only relevant when this play just apt-installed the driver above - when a
+# driver is already active (the .run install on incus-01, or a prior apt
+# install), nouveau has already been dealt with one way or another.
+- name: Regenerate initramfs so the nouveau blacklist takes effect on next boot
+  command: update-initramfs -u
+  changed_when: true
+  when: nvidia_driver_check.rc != 0
+
+- name: Check if nouveau is currently loaded
+  command: lsmod
+  register: lsmod_check
+  changed_when: false
+  when: nvidia_driver_check.rc != 0
+
+- name: Reboot to fully switch the GPUs from nouveau to the nvidia driver
+  reboot:
+    reboot_timeout: 300
+  when: nvidia_driver_check.rc != 0 and 'nouveau' in lsmod_check.stdout
+
+- name: Load the nvidia kernel module
+  command: modprobe nvidia
+  changed_when: false
+
+- name: Load the zfs kernel module
+  command: modprobe zfs
+  changed_when: false
+
+# --- Incus preseed (idempotent: only applies if not already initialised) ----
+- name: Check if Incus is already initialised
+  command: incus storage list -f csv
+  register: incus_storage_check
+  changed_when: false
+  failed_when: false
+
+- name: Preseed Incus (storage pool + bridged network profile)
+  vars:
+    incus_preseed:
+      config: {}
+      networks: []
+      storage_pools:
+        - name: "{{ incus_storage_pool }}"
+          driver: "{{ incus_storage_driver }}"
+          config: "{{ {'size': incus_storage_size} if incus_storage_driver == 'zfs' else {} }}"
+      profiles:
+        - name: default
+          devices:
+            root:
+              path: /
+              pool: "{{ incus_storage_pool }}"
+              type: disk
+            eth0:
+              name: eth0
+              nictype: bridged
+              parent: "{{ bridge_name }}"
+              type: nic
+  command: incus admin init --preseed
+  args:
+    stdin: "{{ incus_preseed | to_nice_yaml }}"
+  when: "incus_storage_check.stdout is not defined or incus_storage_pool not in incus_storage_check.stdout"
+
+# Neither remote is preconfigured by "incus admin init" - the terraform/ image
+# references (docker:..., ghcr:...) fail with "The remote ... doesn't exist"
+# until these are added explicitly, even on an Incus new enough for OCI.
+# UniFi's Ubuntu image comes from the "images:" remote instead (already
+# built in) - cloud-images.ubuntu.com's own simplestreams endpoint returned
+# zero images against this Incus build, so there's no "ubuntu:" remote here.
+- name: Add docker OCI remote for native container image pulls
+  command: incus remote add docker https://docker.io --protocol=oci
+  register: docker_remote
+  changed_when: "'already exists' not in (docker_remote.stderr | default(''))"
+  failed_when: docker_remote.rc != 0 and 'already exists' not in docker_remote.stderr
+
+- name: Add ghcr OCI remote (Frigate, python-matter-server are published here, not Docker Hub)
+  command: incus remote add ghcr https://ghcr.io --protocol=oci
+  register: ghcr_remote
+  changed_when: "'already exists' not in (ghcr_remote.stderr | default(''))"
+  failed_when: ghcr_remote.rc != 0 and 'already exists' not in ghcr_remote.stderr
+
+# The pool file is sparse with a 300GiB apparent size, but it lives on the
+# NVMe root disk (~217GiB). Without a cap, the pool growing past the free
+# space would hit ENOSPC underneath ZFS, which is far nastier than ZFS itself
+# refusing writes. A quota makes ZFS stop first.
+- name: Read the current ZFS quota on the Incus pool
+  command: "zfs get -H -o value quota {{ incus_storage_pool }}"
+  register: zfs_pool_quota
+  changed_when: false
+  failed_when: false
+  when: incus_storage_driver == 'zfs'
+
+- name: Cap the ZFS pool below the NVMe's capacity
+  command: "zfs set quota={{ nvme_zfs_quota }} {{ incus_storage_pool }}"
+  when:
+    - incus_storage_driver == 'zfs'
+    - zfs_pool_quota.rc == 0
+    - zfs_pool_quota.stdout | trim | upper != nvme_zfs_quota | upper

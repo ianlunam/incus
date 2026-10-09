@@ -1,0 +1,8 @@
+---
+extends: relaxed
+rules:
+  line-length: disable        # long task descriptions/URLs are normal here
+  indentation: {spaces: consistent, indent-sequences: whatever}
+  truthy:
+    check-keys: false          # GitHub Actions uses `on:`
+    allowed-values: ["true", "false", "yes", "no"]

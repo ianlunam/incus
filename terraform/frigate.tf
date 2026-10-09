@@ -2,23 +2,23 @@
 # created by Ansible (applied in addition to "default" so it keeps the
 # bridged NIC/root disk from default and adds the GPU device on top).
 resource "incus_instance" "frigate" {
-  name     = "frigate"
-  image    = "ghcr:blakeblackshear/frigate:stable-tensorrt" # NVIDIA GPU detector support - plain
-                                                              # "stable" doesn't bundle the CUDA/
-                                                              # TensorRT runtime needed for this at all
+  name  = "frigate"
+  image = "ghcr:blakeblackshear/frigate:stable-tensorrt" # NVIDIA GPU detector support - plain
+  # "stable" doesn't bundle the CUDA/
+  # TensorRT runtime needed for this at all
   type     = "container"
   profiles = ["default", "gpu-1070"]
 
   config = {
-    "limits.cpu"    = "4"
-    "limits.memory" = "4GiB"
+    "limits.cpu"     = "4"
+    "limits.memory"  = "4GiB"
     "boot.autostart" = "true"
     # Incus's nvidia.runtime only injects libs for the capabilities named
     # here (default compute,utility) - it ignores the NVIDIA_DRIVER_CAPABILITIES
     # env var Frigate's image sets. `video` adds libnvidia-encode/libnvcuvid
     # so ffmpeg's h264_nvenc works (re-encoding the cameras' MJPEG for
     # recording on the CPU was the main source of Frigate's load).
-    "nvidia.driver.capabilities" = "compute,video,utility"
+    "nvidia.driver.capabilities"        = "compute,video,utility"
     "environment.FRIGATE_RTSP_PASSWORD" = "changeme"
     # Frigate wants /dev/shm sized up for its detection buffers - the LXC
     # default (64MB) isn't enough for more than one camera, and this doesn't

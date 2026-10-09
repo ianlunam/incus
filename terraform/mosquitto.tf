@@ -17,7 +17,7 @@ resource "incus_instance" "mosquitto" {
     # Incus container can't chown a bind-mounted host directory it doesn't
     # already own, so this needs real host root.
     "security.privileged" = "true"
-    "boot.autostart"       = "true"
+    "boot.autostart"      = "true"
   }
 
   device {

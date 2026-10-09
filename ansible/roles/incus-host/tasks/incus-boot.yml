@@ -1,0 +1,45 @@
+# incus-startup.service is what actually boots the boot.autostart instances;
+# make it wait for the persistence daemon and power caps so instances never
+# start against half-initialised GPUs. NOTE: this did NOT fix Ollama landing
+# on CPU after a reboot - that turned out to be GPU discovery hitting
+# Ollama's hard 30s watchdog while the host was swamped booting the VMs (see
+# the ollama-gpu-check units below).
+- name: Create drop-in directories for Incus units
+  file:
+    path: "/etc/systemd/system/{{ item }}.service.d"
+    state: directory
+    mode: "0755"
+  loop:
+    - incus
+    - incus-startup
+
+- name: Order Incus instance autostart after the NVIDIA units
+  copy:
+    dest: "/etc/systemd/system/{{ item }}.service.d/10-nvidia-ready.conf"
+    mode: "0644"
+    content: |
+      [Unit]
+      Wants=nvidia-persistenced.service nvidia-power-limits.service
+      After=nvidia-persistenced.service nvidia-power-limits.service
+  loop:
+    - incus
+    - incus-startup
+  register: incus_gpu_dropin
+
+# If the bind mount ever failed at boot, Incus would silently start against
+# the empty directory underneath and initialise a brand new, empty state.
+# RequiresMountsFor makes it refuse to start instead.
+- name: Require the /var/lib/incus mount before starting Incus
+  copy:
+    dest: /etc/systemd/system/incus.service.d/20-require-state-mount.conf
+    mode: "0644"
+    content: |
+      [Unit]
+      RequiresMountsFor=/var/lib/incus
+  register: incus_mount_dropin
+
+# Reloads unit files only - doesn't restart incus or touch running instances.
+- name: Reload systemd for the Incus drop-ins
+  systemd:
+    daemon_reload: true
+  when: incus_gpu_dropin.changed or incus_mount_dropin.changed

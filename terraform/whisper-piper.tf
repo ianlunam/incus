@@ -8,8 +8,8 @@ resource "incus_instance" "whisper" {
   profiles = ["default", "gpu-1650"]
 
   config = {
-    "limits.cpu"    = "2"
-    "limits.memory" = "2GiB"
+    "limits.cpu"     = "2"
+    "limits.memory"  = "2GiB"
     "boot.autostart" = "true"
     # docker_run.sh defaults to --device cpu unless this is set - it's the
     # same env var the image's own Dockerfile.gpu variant uses, so this is
@@ -72,8 +72,8 @@ resource "incus_instance" "piper" {
   profiles = ["default", "gpu-1650"]
 
   config = {
-    "limits.cpu"    = "2"
-    "limits.memory" = "2GiB"
+    "limits.cpu"     = "2"
+    "limits.memory"  = "2GiB"
     "boot.autostart" = "true"
     # The image's entrypoint requires --voice with no default (bare
     # `docker_run.sh` exits with "error: --voice is required for the piper

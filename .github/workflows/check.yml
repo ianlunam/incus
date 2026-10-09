@@ -1,0 +1,35 @@
+name: check
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # GitHub-hosted runner: this repo is on a private personal account, so the
+    # usual self-hosted-only rule doesn't apply here.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
+
+      - name: Install tooling
+        run: pip install ansible-core ansible-lint yamllint -r tests/requirements.txt
+
+      # shellcheck is preinstalled on ubuntu-latest, so the embedded-script
+      # test uses it rather than falling back to `sh -n`.
+      - name: Run checks
+        run: ./check.sh

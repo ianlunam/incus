@@ -1,0 +1,19 @@
+---
+# Baseline: gate on real problems (unresolvable modules, syntax, deprecated
+# or risky constructs) but not pure style, which this repo wasn't written to.
+# Remove a line from skip_list to start enforcing that rule - each is fixable
+# on its own without touching behaviour.
+exclude_paths:
+  - .git/
+  - terraform/
+skip_list:
+  - fqcn[action-core]            # short builtin names (apt:, copy:, ...) used throughout
+  - name[casing]                 # task names not capitalised in a few places
+  - name[template]
+  - command-instead-of-module    # deliberate: systemctl/git/tar/sed via command where a module's quirks bit
+  - command-instead-of-shell
+  - no-changed-when              # idempotency is verified by a real re-run, see docs/testing.md
+  - no-handler
+  - risky-shell-pipe
+  - yaml[line-length]
+  - line-length

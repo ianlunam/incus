@@ -6,7 +6,7 @@
 # JSON API responses are disabled in SearXNG's default settings.yml (only
 # "html" is listed under search.formats) to deter public-instance scraping -
 # this is a private, LAN-only instance, so that's added by hand after first
-# boot generates the default config (see README). Not templated here since
+# boot generates the default config (see docs/gpu-and-llm.md). Not templated here since
 # a hand-authored settings.yml risks missing keys the image expects; letting
 # the image generate its own default and editing it in place is more
 # reliable, matching how Frigate/Mosquitto configs are handled in this repo.
