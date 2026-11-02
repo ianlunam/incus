@@ -9,6 +9,7 @@ output "service_endpoints" {
     Matter server: <host-ip>:5580 (WebSocket - add via HA's Matter integration)
     UniFi OS Server: https://<unifi-vm-ip>:11443 (bridged VM, own DHCP address - check `incus list unifi` or router leases; initial setup wizard on first load - can take a few minutes on first boot)
     ESPHome dashboard: http://<host-ip>:6052
+    Sandbox VM:     ssh ian@<sandbox-vm-ip>  (bridged VM, own DHCP address - check `incus list sandbox` or router leases)
 
     Thread/Zigbee radio is passed through to the HAOS VM itself (not a
     container) - configure OTBR/Zigbee via HAOS's own add-ons store.

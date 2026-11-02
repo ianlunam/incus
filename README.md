@@ -27,6 +27,8 @@ managed by the same tool:
            -> container:  esphome         (CPU/RAM-heavy on demand - PlatformIO
                                             firmware builds, otherwise idle dashboard)
            -> VM:        unifi           (UniFi OS Server - needs a full OS, not a container)
+           -> VM:        sandbox         (Ubuntu 26.04 LTS - scratch box to ssh into for
+                                            trying curl commands etc. that fail from elsewhere)
 
 GPU split: the 1070 (more VRAM/compute) is shared between Frigate and Ollama,
 the two heaviest consumers, with the 1650 handling Whisper (Piper stays on
@@ -79,6 +81,7 @@ terraform/
   searxng.tf                   <- self-hosted search (web tool for Ollama, see docs/gpu-and-llm.md)
   esphome.tf                   <- ESPHome dashboard (flash/manage m5stack Atom Echo S3R units)
   unifi.tf                     <- UniFi OS Server (runs as a VM, not a container - see file)
+  sandbox.tf                   <- Ubuntu 26.04 scratch VM for ssh (curl experiments etc.)
   outputs.tf                   <- endpoint summary + HA wiring instructions
 docs/                          <- detail split out of this README (see "More detail")
 tests/, check.sh               <- pytest suite + ./check.sh (linters/validation); CI runs it

@@ -14,6 +14,23 @@ Known rough edges for individual services. Back to the [README](../README.md).
   container image for the Network/Protect/Access "apps" - if it looks stuck,
   give it a few minutes before assuming it's broken.
 
+- **Sandbox VM**: `sandbox.tf` is a small Ubuntu 26.04 LTS server (1 vCPU,
+  1GiB, 10GiB disk) for ssh-ing into to try things that don't work from the
+  work laptop, e.g. a `curl` through a different network path. Key-only login
+  as `ian` using `sandbox_ssh_public_key` (defaults to the laptop's
+  `id_ed25519.pub`; override it in `terraform.tfvars`). It's bridged with a
+  pinned MAC like UniFi, so find its address with `incus list sandbox` and
+  give it a router reservation. cloud-init installs `openssh-server` (the image
+  has no sshd), `curl`, `bind9-dnsutils` (what `dnsutils` is called on 26.04),
+  `jq` and `traceroute` on first boot, so give it a minute or two before the
+  first ssh. Ubuntu 26.04's image is `images:ubuntu/26.04/cloud` (codename
+  "resolute"); cloud-init user-data only applies on first boot, so edit
+  `sandbox.tf` and recreate the VM rather than expecting changes to land on an
+  existing one (`terraform apply -replace=incus_instance.sandbox`). One bad
+  package name makes cloud-init skip the whole `packages:` list, which with
+  sshd in it means no ssh at all - check `incus exec sandbox -- cloud-init
+  status --long` if it won't connect.
+
 - **ESPHome + m5stack Atom Echo S3R voice satellites**: `esphome.tf` runs the
   ESPHome dashboard container for building/flashing firmware. The Atom Echo
   units themselves aren't Incus resources - they're standalone ESP32-S3
