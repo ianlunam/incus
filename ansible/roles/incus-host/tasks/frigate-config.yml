@@ -1,0 +1,18 @@
+---
+# Frigate's config.yml, rendered from templates/frigate-config.yml.j2 so the
+# camera setup is reproducible. Needs the volume directory from volumes.yml,
+# and terraform/frigate.tf applied first with frigate_ha_token set - the
+# config references {FRIGATE_HA_TOKEN}, and Frigate drops into safe mode if
+# that variable isn't set in the container.
+#
+# 0666 so Frigate (a shifted, unpredictable host UID inside the unprivileged
+# container - see volumes.yml) can still write the file, e.g. its version
+# stamp. The template is the source of truth: this overwrites hand edits
+# (a timestamped backup of the old file is kept alongside it).
+- name: Render Frigate's config.yml
+  template:
+    src: frigate-config.yml.j2
+    dest: /var/incus-volumes/frigate/config/config.yml
+    mode: "0666"
+    backup: true
+  notify: restart frigate

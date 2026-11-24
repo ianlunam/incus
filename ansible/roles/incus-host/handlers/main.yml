@@ -13,3 +13,11 @@
     delay: 10
     timeout: 90
   listen: "apply networking changes"
+
+# Frigate only reads config.yml at startup. Tolerates the instance not
+# existing yet (first run, before terraform apply).
+- name: restart frigate
+  command: incus restart frigate
+  register: frigate_restart
+  changed_when: frigate_restart.rc == 0
+  failed_when: frigate_restart.rc != 0 and 'not found' not in (frigate_restart.stderr | lower)

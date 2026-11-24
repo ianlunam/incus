@@ -26,6 +26,9 @@
 - name: Container volumes
   import_tasks: volumes.yml           # bind-mounted container volumes + default mosquitto.conf
   tags: [volumes]
+- name: Frigate config
+  import_tasks: frigate-config.yml    # Frigate's config.yml rendered from a template (needs frigate_ha_token set in terraform)
+  tags: [frigate-config]
 - name: RTL-SDR dongle
   import_tasks: rtl-sdr.yml           # keep DVB-T drivers off the RTL-SDR dongle
   tags: [rtl-sdr]

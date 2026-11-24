@@ -1,0 +1,88 @@
+# Managed by Ansible (roles/incus-host/templates/frigate-config.yml.j2).
+# Edits made here or in Frigate's config editor are overwritten on the next
+# run - change the template or the frigate_* vars in group_vars/all.yml.
+#
+# The Home Assistant token is NOT in this file: Frigate substitutes
+# {FRIGATE_*} environment variables, and FRIGATE_HA_TOKEN is set on the
+# instance by terraform/frigate.tf (from the frigate_ha_token variable).
+mqtt:
+  host: {{ frigate_mqtt_host }}
+  port: 1883
+
+detectors:
+  onnx:
+    type: onnx
+
+# The ONNX file itself is not managed here - export it at the size below
+# (width/height must match what it was exported with).
+model:
+  model_type: yolo-generic
+  width: {{ frigate_model_size }}
+  height: {{ frigate_model_size }}
+  input_tensor: nchw
+  input_dtype: float
+  input_pixel_format: rgb
+  path: /config/model_cache/yolo.onnx
+  labelmap_path: /labelmap/coco-80.txt
+
+record:
+  enabled: true
+  alerts:
+    retain:
+      days: {{ frigate_retain_days }}
+      mode: motion
+  detections:
+    retain:
+      days: {{ frigate_retain_days }}
+      mode: motion
+
+snapshots:
+  enabled: true
+
+objects:
+  track:
+    - person
+    - cat
+    - dog
+    - car
+  filters:
+    # The model sometimes calls cats dogs; ignore weak "dog" calls.
+    dog:
+      min_score: {{ frigate_dog_min_score }}
+      threshold: {{ frigate_dog_threshold }}
+
+cameras:
+{% for cam in frigate_cameras %}
+  {{ cam.name }}:
+    ffmpeg:
+      # Decode on the CPU: with the `video` driver capability Frigate would
+      # auto-enable CUDA decode, which can't handle these cameras' MJPEG.
+      hwaccel_args: []
+      output_args:
+        # NVENC on the 1650 SUPER (-gpu 1); the segment args are required.
+        record: -f segment -segment_time 10 -segment_format mp4 -reset_timestamps 1 -strftime 1 -c:v h264_nvenc -gpu 1 -pix_fmt yuv420p -rc vbr -cq 28 -b:v 0 -an
+      inputs:
+        - path: {{ ha_url }}/api/camera_proxy_stream/{{ cam.ha_entity }}
+          input_args:
+            - -headers
+            - 'Authorization: Bearer {FRIGATE_HA_TOKEN}'
+            - -analyzeduration
+            - '10000000'
+            - -probesize
+            - '10000000'
+            - -use_wallclock_as_timestamps
+            - '1'
+            - -f
+            - mjpeg
+          roles:
+            - detect
+            - record
+    detect:
+      width: {{ frigate_detect_width }}
+      height: {{ frigate_detect_height }}
+      fps: {{ frigate_detect_fps }}
+{% endfor %}
+
+# Frigate stamps (and rewrites the file with) this on first load; keeping it
+# here stops the rewrite from making the next Ansible run report "changed".
+version: 0.18-0

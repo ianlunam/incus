@@ -11,8 +11,9 @@ managed by the same tool:
          share the host's GPU driver, unlike VM passthrough)
       -> Incus
            -> VM:        haos            (Home Assistant OS, no GPU needed)
-           -> container:  frigate         (GPU: 1070 - object detection, onnx/CUDA;
-                                            1650 - NVENC recording encode)
+           -> container:  frigate         (GPU: both cards are visible to it. In practice
+                                            onnx detection runs on the 1650 and NVENC
+                                            recording on the 1070 - see docs/gpu-and-llm.md)
            -> container:  ollama          (GPU: 1070 - local LLM for Assist + coding)
            -> container:  whisper         (GPU: 1650 - speech-to-text)
            -> container:  piper           (CPU - text-to-speech; attached to gpu-1650
@@ -30,9 +31,10 @@ managed by the same tool:
            -> VM:        sandbox         (Ubuntu 26.04 LTS - scratch box to ssh into for
                                             trying curl commands etc. that fail from elsewhere)
 
-GPU split: the 1070 (more VRAM/compute) is shared between Frigate and Ollama,
-the two heaviest consumers, with the 1650 handling Whisper (Piper stays on
-CPU regardless of profile). Getting GPU acceleration actually working inside
+GPU split: the 1070 (more VRAM/compute) is Ollama's, the 1650 handles Whisper
+(Piper stays on CPU regardless of profile). Frigate sees both cards; what it
+actually does on each is not what you'd guess from the PCI numbering - see
+"Which GPU Frigate really uses" in [docs/gpu-and-llm.md](docs/gpu-and-llm.md). Getting GPU acceleration actually working inside
 containers needed one non-obvious extra step beyond Incus's `gpu` device -
 see "nvidia.runtime and the container GPU library gap" in
 [docs/gpu-and-llm.md](docs/gpu-and-llm.md). Both cards are confirmed working end-to-end on Pascal/Turing
@@ -64,6 +66,7 @@ ansible/
       gpu-containers.yml       nvidia-container-toolkit + nvidia.runtime, per-GPU profiles
       haos-image.yml           HAOS qcow2 imported as a local image
       volumes.yml              bind-mounted container volumes, default mosquitto.conf
+      frigate-config.yml       Frigate's config.yml rendered from a template
       rtl-sdr.yml              blacklist DVB-T drivers for the RTL-SDR dongle
       power.yml                TLP, CPU governor, GPU power caps, ZFS ARC cap
       incus-boot.yml           start Incus only after the GPUs/mounts are ready
