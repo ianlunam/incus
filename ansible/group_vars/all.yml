@@ -114,3 +114,22 @@ ha_url: "http://192.168.0.149:8123"
 # also at /etc/esphome-backup/deploy_key.pub) to the repo yourself, with
 # write access, since the repo and its access grants are yours to control.
 esphome_backup_repo: "git@github.com:ianlunam/esphome-configs.git"
+
+# ---------------------------------------------------------------------------
+# Frigate (rendered into frigate/config/config.yml by tasks/frigate-config.yml)
+# The HA access token it needs is a terraform variable (frigate_ha_token), not
+# an Ansible one - see terraform/frigate.tf.
+# ---------------------------------------------------------------------------
+frigate_mqtt_host: "{{ bridge_ip }}"
+frigate_model_size: 320          # must match the exported yolo.onnx; 640 is better at cat vs dog
+frigate_retain_days: 14
+frigate_detect_width: 800
+frigate_detect_height: 600
+frigate_detect_fps: 2
+frigate_dog_min_score: 0.6       # the model calls cats "dog" - drop weak dog detections
+frigate_dog_threshold: 0.8
+frigate_cameras:                 # ESP32-CAMs, pulled via HA's camera proxy
+  - name: espcam1
+    ha_entity: camera.camera_1_camera_1
+  - name: espcam2
+    ha_entity: camera.camera_2_camera_1

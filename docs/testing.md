@@ -27,6 +27,10 @@ runs `./check.sh` on pushes to `master` and on pull requests.
 - **`test_repo_invariants.py`** - every instance pins a unique, valid MAC (HAOS is a
   documented exception); every task file is imported exactly once, named and
   tagged; task files parse as task lists; relative links in the markdown resolve.
+- **`test_frigate_config.py`** - the Frigate config template rendered with the real
+  `group_vars`: valid YAML, every camera present, `mqtt:` block present (else
+  safe mode), no token committed, required record segment args, and every
+  `{FRIGATE_*}` placeholder actually set in `frigate.tf`.
 - **`test_metrics_push.py`** - the incus-metrics-push script, rendered from its
   template and fed canned metrics. Includes regressions for two bugs actually hit on
   this host: VMs counting idle time as CPU use, and counter resets showing as

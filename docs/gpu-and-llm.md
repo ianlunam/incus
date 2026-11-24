@@ -34,10 +34,12 @@ Known rough edges around the NVIDIA cards and the Whisper/Piper/Ollama stack. Ba
 - **GPU device syntax** (`incus profile device add ... gpu pci=<addr>`) is
   correct for Incus's GPU device type but pins the whole card to whichever
   container profile uses it - anything sharing a profile gets concurrent
-  access to the same card. Frigate and Ollama both share `gpu-1070` now and
-  fit comfortably (Frigate's detector ~250MB, Ollama's 7B Q4 model
-  ~4.4-5.2GB depending on context length, well under the 1070's 8GB) - keep
-  an eye on `nvidia-smi` if you add a third consumer or a bigger model.
+  access to the same card. Frigate and Ollama both have `gpu-1070` (Frigate
+  also gets the 1650 as a separate device), though Frigate's detector
+  actually lands on the 1650 - see "Which GPU Frigate really uses" below.
+  Ollama's 7B Q4 model is ~4.4-5.2GB depending on context length, well under
+  the 1070's 8GB - keep an eye on `nvidia-smi` if you add a third consumer or
+  a bigger model.
   Ollama itself will only keep one model resident on a GPU at a time by
   default (no `OLLAMA_MAX_LOADED_MODELS` override here) - loading a second
   model that doesn't fit alongside the first evicts it entirely rather than
@@ -137,3 +139,28 @@ Known rough edges around the NVIDIA cards and the Whisper/Piper/Ollama stack. Ba
   released: after any `llm_intents` update, check whether Wikipedia answers
   are actually current, and if not, check the PR's status - if unmerged,
   reapply the same two-line header change by hand.
+
+## Which GPU Frigate really uses
+
+Frigate has both cards (the 1070 via the `gpu-1070` profile, the 1650 as the
+`gpu1650` device in `frigate.tf`), and the original intent was detection on
+the 1070 and NVENC recording on the 1650 (`-gpu 1`). Host `nvidia-smi`
+(2026-11-24, YOLOv9-c at 320, ~17 ms inference) showed the opposite:
+
+| Work | Intended | Observed |
+|---|---|---|
+| ONNX detection (`frigate.detector:onnx`, ~316MiB) | 1070 | **1650** (host GPU 1, Bus-Id `05:00.0`) |
+| NVENC recording (the `ffmpeg` processes, ~118MiB each) | 1650 | **1070** (host GPU 0, Bus-Id `01:00.0`) |
+
+Likely cause (a hypothesis, not tested): `nvidia-smi` numbers GPUs by PCI
+slot, but CUDA defaults to fastest-first, and the 1650 SUPER (Turing) ranks
+ahead of the 1070 (Pascal). So inside the container the ONNX detector's
+default device 0 is the 1650 and ffmpeg's `-gpu 1` is the 1070. Setting
+`CUDA_DEVICE_ORDER=PCI_BUS_ID` on the instance would flip both to the
+original intent.
+
+It is deliberately left as it is: detection on the 1650 shares with the voice
+pipeline (Whisper, ~640MiB) rather than with Ollama (~5GB on the 1070), and
+works well. Check with `nvidia-smi` on the host (container `nvidia-smi` shows
+no processes - PID namespace). If you move anything, expect the other to move
+with it.
